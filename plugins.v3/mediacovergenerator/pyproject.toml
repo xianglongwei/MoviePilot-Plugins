@@ -1,0 +1,10 @@
+[project]
+name = "moviepilot-plugin-mediacovergenerator"
+dynamic = ["version"]
+requires-python = ">=3.12"
+dependencies = [
+    "pillow>=11.2.1",
+    "numpy>=2.2.0",
+    "pytz>=2025.2",
+    "pyyaml>=6.0.2",
+]
