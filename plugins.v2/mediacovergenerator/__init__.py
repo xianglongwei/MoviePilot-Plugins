@@ -693,8 +693,8 @@ class MediaCoverGenerator(_PluginBase):
             {"path": "set_page_tab_generate", "endpoint": self.api_set_page_tab_generate, "auth": "bear", "methods": ["POST"], "summary": "切换到生成页(兼容)"},
             {"path": "set_page_tab_history", "endpoint": self.api_set_page_tab_history, "auth": "bear", "methods": ["POST"], "summary": "切换到历史页(兼容)"},
             {"path": "set_page_tab_clean", "endpoint": self.api_set_page_tab_clean, "auth": "bear", "methods": ["POST"], "summary": "切换到清理页(兼容)"},
-            {"path": "/saved_cover_image", "endpoint": self.api_saved_cover_image, "methods": ["GET"], "summary": "获取已保存封面图片"},
-            {"path": "saved_cover_image", "endpoint": self.api_saved_cover_image, "methods": ["GET"], "summary": "获取已保存封面图片(兼容)"},
+            {"path": "/saved_cover_image", "endpoint": self.api_saved_cover_image, "auth": "bear", "methods": ["GET"], "summary": "获取已保存封面图片"},
+            {"path": "saved_cover_image", "endpoint": self.api_saved_cover_image, "auth": "bear", "methods": ["GET"], "summary": "获取已保存封面图片(兼容)"},
         ]
 
     def api_clean_images(self):

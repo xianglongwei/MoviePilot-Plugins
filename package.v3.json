@@ -32,5 +32,21 @@
             "v0.2": "测试",
             "v0.1": "自定义字体"
         }
+    },
+    "PigGoKidsMetadata": {
+        "name": "PigGo 儿童动画增强识别",
+        "description": "从 PigGo RSS 或粘贴链接发起下载，并扫描 NFO、图片和文件名建立本地媒体身份",
+        "labels": "PigGo,儿童动画,RSS,本地元数据,NFO",
+        "version": "0.3.1",
+        "icon": "emby.png",
+        "author": "xianglongwei",
+        "level": 1,
+        "system_version": ">=3.0.0",
+        "history": {
+            "v0.3.1": "同步 RSS 抓取状态、候选身份修正/忽略/恢复、人工冲突审核与阶段感知重试 API，并限制详情链接为安全 HTTP/HTTPS 协议",
+            "v0.3.0": "第三阶段首版：修复并发与逐文件整理结算，增加 RSS SSRF/大小防护、页面操作入口、只读 TMDb 严格匹配和贡献草稿",
+            "v0.2.0": "第二阶段：增加安全 RSS 候选、粘贴链接、MoviePilot 下载提交、hash 跟踪、事件恢复和可选整理",
+            "v0.1.0": "第一阶段：增加受限内容包扫描、NFO 与图片识别、piggokids 媒体来源、冲突决策和手工扫描接口"
+        }
     }
 }

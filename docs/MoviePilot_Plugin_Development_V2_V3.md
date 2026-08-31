@@ -1,6 +1,6 @@
 # MoviePilot 插件开发手册：V2 / V3 双版本维护
 
-本文是本仓库维护 `MediaCoverGenerator` 插件的工作手册。它不是官方文档的复制版，而是基于 MoviePilot Wiki 和官方插件仓开发文档整理出的落地规则，用来约束后续修改、发布和排错。
+本文主要是本仓库维护 `MediaCoverGenerator` 插件的工作手册。它不是官方文档的复制版，而是基于 MoviePilot Wiki 和官方插件仓开发文档整理出的落地规则，用来约束后续修改、发布和排错。计划新增的 `PigGoKidsMetadata` 以 `docs/PigGoKidsMetadata_Product_Requirements.md` 为需求基线，并复用本文的双版本、依赖和发布规则。
 
 ## 资料入口
 
@@ -14,7 +14,7 @@
 
 ## 本仓库目标
 
-本仓库只发布一个插件：`MediaCoverGenerator`，展示名为 `Emby媒体库封面生成`。仓库必须同时让 MoviePilot V2 和 V3 能发现、安装并加载这个插件。
+当前已发布插件只有 `MediaCoverGenerator`，展示名为 `Emby媒体库封面生成`。计划新增 `PigGoKidsMetadata` 后，仓库仍只保留用户自己维护的这两个插件，不恢复任何上游无关插件。两个插件都必须让 MoviePilot V2 和 V3 正确发现、安装并加载。
 
 当前采用双目录、双索引策略：
 
@@ -138,13 +138,15 @@ V3 普通 JSON API 有两种可选合同：
 - `package.v2.json` / `package.v3.json` 中的 `version`
 - `history` 顶部的当前版本说明
 
-本仓库只保留一个插件，因此索引文件中也只应该有一个顶层键：
+当前发布状态下，索引文件中只有一个顶层键：
 
 ```json
 {
     "MediaCoverGenerator": {}
 }
 ```
+
+`PigGoKidsMetadata` 实现并通过验收后，V2/V3 索引将各新增其顶层键；在实现前不得提前发布空索引项。
 
 MoviePilot 插件市场只读取 GitHub 仓库的 `main` 分支。修改完成后必须推送到 `main`，否则用户刷新插件市场看不到更新。
 
