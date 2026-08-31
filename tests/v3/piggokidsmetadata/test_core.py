@@ -80,6 +80,79 @@ class TaskStateTest(unittest.TestCase):
             task.transition(core.TaskState.COMPLETED)
 
 
+class PublicMediaMatchTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.item = core.LocalMediaItem(
+            media_source=core.MEDIA_SOURCE,
+            media_id="piggo:movie:item:42",
+            media_type=core.MediaKind.MOVIE,
+            title="儿童电影",
+            original_title="Kids Movie",
+            year="2024",
+            aliases=["儿童大电影"],
+        )
+
+    def test_exact_alias_type_and_year_can_reuse_public_identity(self) -> None:
+        result = core.evaluate_public_media_match(self.item, {
+            "media_source": "themoviedb",
+            "media_id": "12345",
+            "type": "电影",
+            "title": "儿童大电影",
+            "original_title": "Kids Movie Remastered",
+            "year": "2024",
+        })
+        self.assertTrue(result["exact"])
+        self.assertEqual(result["media_id"], "12345")
+        self.assertGreaterEqual(result["confidence"], 0.75)
+
+    def test_year_conflict_rejects_otherwise_matching_candidate(self) -> None:
+        result = core.evaluate_public_media_match(self.item, {
+            "media_source": "themoviedb",
+            "media_id": "54321",
+            "type": "电影",
+            "title": "儿童电影",
+            "year": "2014",
+        })
+        self.assertFalse(result["exact"])
+        self.assertIn("year_conflict", result["reasons"])
+
+    def test_v2_source_and_tmdb_id_are_normalized(self) -> None:
+        candidate = {
+            "source": "themoviedb",
+            "tmdb_id": 24680,
+            "title": self.item.title,
+            "type": "电影",
+            "year": self.item.year,
+        }
+        result = core.evaluate_public_media_match(self.item, candidate)
+        self.assertTrue(result["exact"])
+        self.assertEqual(result["media_id"], "24680")
+
+    def test_contribution_draft_keeps_only_relative_evidence(self) -> None:
+        draft = core.build_contribution_draft(
+            core.ImportTask(task_id="draft-task", site_item_id="123"),
+            {
+                "item": self.item.to_dict(),
+                "confidence": 0.91,
+                "nfo_documents": [
+                    {"path": "Movie/movie.nfo"},
+                    {"path": "/private/downloads/movie.nfo"},
+                ],
+                "conflicts": [{
+                    "code": "sample",
+                    "message": "需要复核",
+                    "evidence": ["Movie/movie.nfo", "../../secret"],
+                }],
+            },
+        )
+        self.assertIsNotNone(draft)
+        serialized = str(draft)
+        self.assertIn("Movie/movie.nfo", serialized)
+        self.assertNotIn("/private/downloads", serialized)
+        self.assertNotIn("../../secret", serialized)
+        self.assertEqual(draft["submission"], "manual_only")
+
+
 class PayloadFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

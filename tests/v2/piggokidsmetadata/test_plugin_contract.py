@@ -126,10 +126,78 @@ class V2PluginContractTest(unittest.TestCase):
             self.assertTrue(response["data"]["decision"]["transfer_preview"])
             self.assertEqual({item["auth"] for item in plugin.get_api()}, {"bear"})
             self.assertEqual({item["path"] for item in plugin.get_api()}, {
-                "/status", "/registry", "/scan", "/candidates",
+                "/status", "/registry", "/contribution-drafts", "/scan", "/candidates",
                 "/candidates/refresh", "/candidates/import", "/candidates/download",
-                "/tasks", "/tasks/retry",
+                "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/retry-action",
             })
+
+    def test_exact_tmdb_match_reuses_public_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "Movie"
+            payload.mkdir()
+            (payload / "Movie.mkv").write_bytes(b"")
+            (payload / "movie.nfo").write_text(
+                "<movie><title>V2 儿童电影</title><year>2024</year></movie>",
+                encoding="utf-8",
+            )
+
+            class FakeMetaInfo:
+                def __init__(self, title: str) -> None:
+                    self.title = title
+
+            recognize_calls = []
+
+            class FakeMediaChain:
+                @staticmethod
+                def recognize_by_meta(*_: Any, **kwargs: Any) -> Any:
+                    recognize_calls.append(kwargs)
+                    return types.SimpleNamespace(
+                        source="themoviedb",
+                        media_id=None,
+                        tmdb_id=24680,
+                        title="V2 儿童电影",
+                        original_title=None,
+                        names=[],
+                        year="2024",
+                        type=FakeMediaType.MOVIE,
+                        season=None,
+                    )
+
+            chain = types.ModuleType("app.chain")
+            chain_media = types.ModuleType("app.chain.media")
+            chain_media.MediaChain = FakeMediaChain
+            core_metainfo = types.ModuleType("app.core.metainfo")
+            core_metainfo.MetaInfo = FakeMetaInfo
+            module_names = ["app.chain", "app.chain.media", "app.core.metainfo"]
+            previous = {name: sys.modules.get(name) for name in module_names}
+            sys.modules.update({
+                "app.chain": chain,
+                "app.chain.media": chain_media,
+                "app.core.metainfo": core_metainfo,
+            })
+            try:
+                plugin = self.module.PigGoKidsMetadata()
+                plugin.init_plugin({"enabled": True, "scan_root": str(root)})
+                response = plugin.api_scan({"relative_path": "Movie"})
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = value
+
+            self.assertTrue(response["success"])
+            self.assertEqual(recognize_calls, [{"source": "themoviedb", "obtain_images": False}])
+            decision = response["data"]["decision"]
+            self.assertTrue(decision["public_match"]["exact"])
+            self.assertEqual(decision["item"]["media_source"], "themoviedb")
+            self.assertEqual(decision["item"]["media_id"], "24680")
+            self.assertEqual(plugin.api_status()["data"]["registry_count"], 0)
+            drafts = plugin.api_contribution_drafts()["data"]
+            self.assertEqual(drafts["total"], 1)
+            self.assertEqual(drafts["items"][0]["mode"], "update_existing")
+            self.assertEqual(drafts["items"][0]["target"]["media_id"], "24680")
 
     def test_pasted_download_is_idempotent_and_secret_is_not_persisted(self) -> None:
         plugin = self.module.PigGoKidsMetadata()
@@ -183,8 +251,17 @@ class V2PluginContractTest(unittest.TestCase):
             }))
             task = plugin.api_tasks()["data"]["items"][0]
             self.assertEqual(task["state"], "READY_TO_TRANSFER")
-            plugin.on_transfer_complete(FakeEvent({"download_hash": "d" * 40}))
-            plugin.on_transfer_complete(FakeEvent({"download_hash": "d" * 40}))
+            self.assertTrue(task["transfer_failed_files"])
+            plugin._submit_transfer_to_host = lambda *_: (True, None)
+            retried = plugin.api_retry_task({"task_id": task["task_id"]})
+            self.assertTrue(retried["success"])
+            self.assertEqual(retried["data"]["task"]["transfer_failed_files"], [])
+            completed_event = FakeEvent({
+                "download_hash": "d" * 40,
+                "fileitem": FakeFileItem(path=str(payload / "Movie.mkv")),
+            })
+            plugin.on_transfer_complete(completed_event)
+            plugin.on_transfer_complete(completed_event)
             self.assertEqual(plugin.api_tasks()["data"]["items"][0]["state"], "COMPLETED")
 
     def test_synchronous_download_event_is_not_overwritten(self) -> None:

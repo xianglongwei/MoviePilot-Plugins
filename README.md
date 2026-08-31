@@ -10,6 +10,6 @@ MoviePilot官方插件市场：https://github.com/jxxghp/MoviePilot-Plugins
 
 ### PigGo 儿童动画增强识别
 
-  > 当前开发版本：`0.2.0`（第二阶段，本地待宿主验收）
+  > 当前开发版本：`0.3.0`（第三阶段首版，本地待宿主验收）
 
-  从一个或多个 PigGo RSS 或用户粘贴的磁力/下载链接建立候选，经用户确认后调用 MoviePilot 下载器，并按 hash 跟踪下载、扫描真实内容包中的 NFO、图片和文件名。高置信度结果可选择交给 MoviePilot 整理链处理；自动整理默认关闭。V3 另外注册稳定的 `piggokids` 本地媒体来源。
+  从一个或多个 PigGo RSS 或用户粘贴的磁力/下载链接建立候选，经用户确认后调用 MoviePilot 下载器，并按 hash 跟踪下载、扫描真实内容包中的 NFO、图片和文件名。高置信度结果会优先尝试 MoviePilot 的只读 TMDb 精确匹配，未命中时使用本地身份；自动整理默认关闭。V3 另外注册稳定的 `piggokids` 本地媒体来源。

@@ -6,6 +6,8 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from enum import Enum
@@ -162,10 +164,40 @@ class PluginContractTest(unittest.TestCase):
         apis = self.plugin.get_api()
         self.assertEqual({item["auth"] for item in apis}, {"bear"})
         self.assertEqual({item["path"] for item in apis}, {
-            "/status", "/registry", "/scan", "/candidates",
+            "/status", "/registry", "/contribution-drafts", "/scan", "/candidates",
             "/candidates/refresh", "/candidates/import", "/candidates/download",
-            "/tasks", "/tasks/retry",
+            "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/retry-action",
         })
+
+    def test_feed_fetch_stops_after_size_limit(self) -> None:
+        response = types.SimpleNamespace(status_code=200, headers={}, closed=False)
+
+        def iter_content(chunk_size: int):
+            self.assertEqual(chunk_size, 64 * 1024)
+            for _ in range(82):
+                yield b"x" * (64 * 1024)
+
+        response.iter_content = iter_content
+        response.close = lambda: setattr(response, "closed", True)
+
+        class FakeRequestUtils:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            def get_res(self, *_: Any, **__: Any) -> Any:
+                return response
+
+        network = types.ModuleType("app.sdk.network")
+        network.RequestUtils = FakeRequestUtils
+        sys.modules["app.sdk.network"] = network
+        original_validator = self.module.validate_public_http_url
+        self.module.validate_public_http_url = lambda value: value
+        try:
+            with self.assertRaises(self.module.PigGoCoreError):
+                self.plugin._fetch_feed_content("https://piggo.example/rss")
+        finally:
+            self.module.validate_public_http_url = original_validator
+        self.assertTrue(response.closed)
 
     def test_media_source_and_exact_recognition_use_same_identity(self) -> None:
         response = self.plugin.api_scan({"relative_path": "KidsMovie", "site_item_id": "123"})
@@ -181,6 +213,61 @@ class PluginContractTest(unittest.TestCase):
         source = self.plugin.get_media_source()[0]
         self.assertEqual(source["media_source"], self.module.PLUGIN_SOURCE)
 
+    def test_exact_tmdb_match_reuses_public_identity(self) -> None:
+        class FakeMetaInfo:
+            def __init__(self, title: str) -> None:
+                self.title = title
+
+        class FakeMediaChain:
+            @staticmethod
+            def recognize_by_meta(*_: Any, **__: Any) -> FakeMediaInfo:
+                return FakeMediaInfo(
+                    media_source=FakeMediaSource("themoviedb"),
+                    media_id="98765",
+                    title="儿童电影",
+                    original_title="Kids Movie",
+                    names=[],
+                    year="2024",
+                    type=FakeMediaType.MOVIE,
+                    season=None,
+                )
+
+        chain = types.ModuleType("app.chain")
+        chain_media = types.ModuleType("app.chain.media")
+        chain_media.MediaChain = FakeMediaChain
+        domain = types.ModuleType("app.domain")
+        domain_metainfo = types.ModuleType("app.domain.metainfo")
+        domain_metainfo.MetaInfo = FakeMetaInfo
+        module_names = ["app.chain", "app.chain.media", "app.domain", "app.domain.metainfo"]
+        previous = {name: sys.modules.get(name) for name in module_names}
+        old_tmdb = getattr(FakeMediaSource, "TMDB", None)
+        FakeMediaSource.TMDB = FakeMediaSource("themoviedb")
+        sys.modules.update({
+            "app.chain": chain,
+            "app.chain.media": chain_media,
+            "app.domain": domain,
+            "app.domain.metainfo": domain_metainfo,
+        })
+        try:
+            response = self.plugin.api_scan({"relative_path": "KidsMovie"})
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+            if old_tmdb is None:
+                delattr(FakeMediaSource, "TMDB")
+            else:
+                FakeMediaSource.TMDB = old_tmdb
+
+        self.assertTrue(response.success)
+        decision = response.data["decision"]
+        self.assertTrue(decision["public_match"]["exact"])
+        self.assertEqual(decision["item"]["media_source"], "themoviedb")
+        self.assertEqual(decision["item"]["media_id"], "98765")
+        self.assertEqual(self.plugin.api_status().data["registry_count"], 0)
+
     def test_repeated_scan_upserts_task_and_decision(self) -> None:
         first = self.plugin.api_scan({"relative_path": "KidsMovie"})
         second = self.plugin.api_scan({"relative_path": "KidsMovie"})
@@ -190,6 +277,10 @@ class PluginContractTest(unittest.TestCase):
         self.assertEqual(status["task_count"], 1)
         self.assertEqual(status["decision_count"], 1)
         self.assertEqual(status["registry_count"], 1)
+        drafts = self.plugin.api_contribution_drafts().data
+        self.assertEqual(drafts["total"], 1)
+        self.assertNotIn(str(self.root), json.dumps(drafts, ensure_ascii=False))
+        self.assertEqual(drafts["items"][0]["submission"], "manual_only")
 
     def test_review_item_is_not_exposed_as_recognizable_media(self) -> None:
         mixed = self.root / "Mixed"
@@ -282,10 +373,90 @@ class PluginContractTest(unittest.TestCase):
         task = self.plugin.api_tasks().data["items"][0]
         self.assertEqual(task["state"], "READY_TO_TRANSFER")
         self.assertEqual(task["relative_source_path"], "KidsMovie")
-        self.plugin.on_transfer_complete(FakeEvent({"download_hash": "b" * 40}))
-        self.plugin.on_transfer_complete(FakeEvent({"download_hash": "b" * 40}))
+        self.assertTrue(task["transfer_failed_files"])
+        self.plugin._submit_transfer_to_host = lambda *_: (True, None)
+        retried = self.plugin.api_retry_task({"task_id": task["task_id"]})
+        self.assertTrue(retried.success)
+        self.assertEqual(retried.data["task"]["transfer_failed_files"], [])
+        completed_event = FakeEvent({
+            "download_hash": "b" * 40,
+            "fileitem": FakeFileItem(path=str(self.root / "KidsMovie" / "KidsMovie.mkv")),
+        })
+        self.plugin.on_transfer_complete(completed_event)
+        self.plugin.on_transfer_complete(completed_event)
         task = self.plugin.api_tasks().data["items"][0]
         self.assertEqual(task["state"], "COMPLETED")
+
+    def test_multi_file_transfer_waits_for_every_file_and_keeps_failures(self) -> None:
+        payload = self.root / "Season"
+        payload.mkdir()
+        first = payload / "Show.S01E01.mkv"
+        second = payload / "Show.S01E02.mkv"
+        first.write_bytes(b"")
+        second.write_bytes(b"")
+        task = self.module.ImportTask(
+            task_id="multi-transfer",
+            state=self.module.TaskState.TRANSFERRING,
+            download_hash="c" * 40,
+            relative_source_path="Season",
+            transfer_expected_files=["Season/Show.S01E01.mkv", "Season/Show.S01E02.mkv"],
+        )
+        self.plugin._save_task(task)
+        self.plugin.on_transfer_complete(FakeEvent({
+            "download_hash": "c" * 40,
+            "fileitem": FakeFileItem(path=str(first)),
+        }))
+        current = self.plugin._find_task("multi-transfer")
+        self.assertEqual(current.state, self.module.TaskState.TRANSFERRING)
+        self.plugin.on_transfer_failed(FakeEvent({
+            "download_hash": "c" * 40,
+            "fileitem": FakeFileItem(path=str(second)),
+        }))
+        current = self.plugin._find_task("multi-transfer")
+        self.assertNotEqual(current.state, self.module.TaskState.COMPLETED)
+        self.assertEqual(current.transfer_completed_files, ["Season/Show.S01E01.mkv"])
+        self.assertEqual(current.transfer_failed_files, ["Season/Show.S01E02.mkv"])
+
+    def test_concurrent_download_submissions_do_not_cross_assign_hashes(self) -> None:
+        imported = [
+            self.plugin.api_import_candidate({
+                "download_reference": "magnet:?xt=urn:btih:" + character * 40,
+                "title": f"并发任务 {character}",
+            })
+            for character in ("1", "2")
+        ]
+        candidate_ids = [item.data["candidate"]["candidate_id"] for item in imported]
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+
+        def submit(_candidate: Any, reference: str) -> str:
+            nonlocal active, maximum
+            download_hash = reference.rsplit(":", 1)[-1]
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.02)
+            self.plugin.on_download_added(FakeEvent({
+                "source": self.module.DOWNLOAD_SOURCE,
+                "hash": download_hash,
+            }))
+            with guard:
+                active -= 1
+            return download_hash
+
+        self.plugin._submit_download_to_host = submit
+        threads = [
+            threading.Thread(target=self.plugin.api_download_candidate, args=({"candidate_id": candidate_id},))
+            for candidate_id in candidate_ids
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(maximum, 1)
+        tasks = {item["candidate_id"]: item for item in self.plugin.api_tasks().data["items"]}
+        self.assertEqual({tasks[candidate_id]["download_hash"] for candidate_id in candidate_ids}, {"1" * 40, "2" * 40})
 
     def test_synchronous_download_event_is_not_overwritten(self) -> None:
         imported = self.plugin.api_import_candidate({

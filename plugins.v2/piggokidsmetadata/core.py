@@ -155,6 +155,9 @@ class ImportTask:
     download_hash: Optional[str] = None
     relative_source_path: Optional[str] = None
     torrent_files: list[str] = field(default_factory=list)
+    transfer_expected_files: list[str] = field(default_factory=list)
+    transfer_completed_files: list[str] = field(default_factory=list)
+    transfer_failed_files: list[str] = field(default_factory=list)
     media_id: Optional[str] = None
     last_error_code: Optional[str] = None
     created_at: str = field(default_factory=_utc_now)
@@ -194,11 +197,17 @@ class ImportTask:
         except ValueError:
             values["state"] = TaskState.RETRYABLE_FAILED
             values["last_error_code"] = "invalid_persisted_state"
-        values["torrent_files"] = [
-            str(item)[:1_000]
-            for item in values.get("torrent_files") or []
-            if isinstance(item, str) and item
-        ][:10_000]
+        for field_name in (
+            "torrent_files",
+            "transfer_expected_files",
+            "transfer_completed_files",
+            "transfer_failed_files",
+        ):
+            values[field_name] = [
+                str(item)[:1_000]
+                for item in values.get(field_name) or []
+                if isinstance(item, str) and item
+            ][:10_000]
         values["history"] = [
             dict(item)
             for item in values.get("history") or []
@@ -318,9 +327,204 @@ class RecognitionDecision:
     nfo_documents: list[NfoMetadata]
     payload: DownloadedPayload
     transfer_preview: Optional[TransferPreview]
+    public_match: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return _json_value(self)
+
+
+def _public_media_kind(value: Any) -> MediaKind:
+    text = str(getattr(value, "value", value) or "").casefold()
+    if text in {"movie", "电影", "film"}:
+        return MediaKind.MOVIE
+    if text in {"tv", "电视剧", "series", "show"}:
+        return MediaKind.TV
+    return MediaKind.UNKNOWN
+
+
+def _public_value(candidate: Any, name: str, default: Any = None) -> Any:
+    if isinstance(candidate, Mapping):
+        return candidate.get(name, default)
+    return getattr(candidate, name, default)
+
+
+def evaluate_public_media_match(item: LocalMediaItem, candidate: Any) -> dict[str, Any]:
+    """保守评估公共来源候选；只有身份、类型和标题明确一致才算精确命中。"""
+
+    raw_media_source = _public_value(candidate, "media_source") or _public_value(candidate, "source")
+    media_source = str(getattr(raw_media_source, "value", raw_media_source) or "").strip()
+    media_id = str(_public_value(candidate, "media_id") or "").strip()
+    if not media_id:
+        source_id_fields = {
+            "themoviedb": "tmdb_id",
+            "douban": "douban_id",
+            "bangumi": "bangumi_id",
+            "anilist": "anilist_id",
+            "imdb": "imdb_id",
+            "tvdb": "tvdb_id",
+        }
+        media_id = str(_public_value(candidate, source_id_fields.get(media_source, "")) or "").strip()
+    title = str(_public_value(candidate, "title") or "").strip()
+    original_title = str(_public_value(candidate, "original_title") or "").strip()
+    names = [str(value).strip() for value in (_public_value(candidate, "names", []) or []) if value]
+    local_titles = {
+        normalize_title(value)
+        for value in [item.title, item.original_title, *item.aliases]
+        if value
+    }
+    remote_titles = {
+        normalize_title(value)
+        for value in [title, original_title, *names]
+        if value
+    }
+    title_exact = bool(local_titles & remote_titles)
+    remote_kind = _public_media_kind(_public_value(candidate, "type"))
+    type_exact = remote_kind == item.media_type
+    local_year = str(item.year or "")[:4]
+    remote_year = str(_public_value(candidate, "year") or "")[:4]
+    year_conflict = bool(local_year and remote_year and local_year != remote_year)
+    local_season = item.season
+    remote_season = _public_value(candidate, "season")
+    try:
+        remote_season = int(remote_season) if remote_season is not None else None
+    except (TypeError, ValueError):
+        remote_season = None
+    season_conflict = bool(
+        item.media_type == MediaKind.TV
+        and local_season is not None
+        and remote_season is not None
+        and local_season != remote_season
+    )
+    confidence = 0.0
+    confidence += 0.55 if title_exact else 0.0
+    confidence += 0.20 if type_exact else 0.0
+    confidence += 0.15 if local_year and remote_year and not year_conflict else 0.0
+    confidence += 0.10 if item.media_type != MediaKind.TV or not season_conflict else 0.0
+    exact = bool(
+        media_source
+        and media_id
+        and title_exact
+        and type_exact
+        and not year_conflict
+        and not season_conflict
+        and confidence >= 0.75
+    )
+    reasons = []
+    if not title_exact:
+        reasons.append("title_mismatch")
+    if not type_exact:
+        reasons.append("type_mismatch")
+    if year_conflict:
+        reasons.append("year_conflict")
+    if season_conflict:
+        reasons.append("season_conflict")
+    if not media_source or not media_id:
+        reasons.append("missing_public_identity")
+    return {
+        "exact": exact,
+        "confidence": round(confidence, 2),
+        "media_source": media_source or None,
+        "media_id": media_id or None,
+        "title": title or None,
+        "year": remote_year or None,
+        "media_type": remote_kind.value,
+        "reasons": reasons,
+    }
+
+
+def build_contribution_draft(
+    task: ImportTask | Mapping[str, Any],
+    decision: RecognitionDecision | Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """从已脱敏识别决策生成只读贡献草稿，不携带绝对路径或私密 URL。"""
+
+    task_values = task.to_dict() if isinstance(task, ImportTask) else dict(task or {})
+    decision_values = (
+        decision.to_dict()
+        if isinstance(decision, RecognitionDecision)
+        else dict(decision or {})
+    )
+    item = dict(decision_values.get("item") or {})
+    if not item:
+        return None
+    task_id = str(task_values.get("task_id") or "").strip()
+    public_match = dict(decision_values.get("public_match") or {})
+    public_source = str(public_match.get("media_source") or "").strip()
+    public_id = str(public_match.get("media_id") or "").strip()
+    exact_tmdb = bool(
+        public_match.get("exact")
+        and public_source == "themoviedb"
+        and public_id
+    )
+
+    def safe_evidence(value: Any) -> Optional[str]:
+        text = str(value or "").strip().replace("\\", "/")[:1_000]
+        if not text or text.startswith("/") or re.match(r"^[A-Za-z]:/", text):
+            return None
+        parts = [part for part in text.split("/") if part not in ("", ".")]
+        if not parts or ".." in parts:
+            return None
+        return "/".join(parts)
+
+    nfo_paths = sorted({
+        safe_path
+        for document in decision_values.get("nfo_documents") or []
+        if isinstance(document, Mapping)
+        and (safe_path := safe_evidence(document.get("path")))
+    })
+    artwork = sorted({
+        safe_path
+        for value in (item.get("poster_file"), item.get("fanart_file"))
+        if (safe_path := safe_evidence(value))
+    })
+    conflicts = [
+        {
+            "code": str(conflict.get("code") or ""),
+            "message": str(conflict.get("message") or ""),
+            "evidence": [
+                safe_path
+                for value in conflict.get("evidence") or []
+                if (safe_path := safe_evidence(value))
+            ],
+        }
+        for conflict in decision_values.get("conflicts") or []
+        if isinstance(conflict, Mapping)
+    ]
+    suggested = {
+        key: item.get(key)
+        for key in (
+            "title",
+            "original_title",
+            "year",
+            "season",
+            "episode_count",
+            "overview",
+            "aliases",
+            "genres",
+        )
+        if item.get(key) not in (None, "", [])
+    }
+    return {
+        "draft_id": hashlib.sha256(f"contribution:{task_id}".encode("utf-8")).hexdigest()[:24],
+        "task_id": task_id,
+        "mode": "update_existing" if exact_tmdb else "create_or_find",
+        "target": {
+            "media_source": public_source or None,
+            "media_id": public_id or None,
+        },
+        "media_type": str(item.get("media_type") or MediaKind.UNKNOWN.value),
+        "suggested_fields": suggested,
+        "evidence": {
+            "site_item_id": task_values.get("site_item_id"),
+            "candidate_id": task_values.get("candidate_id"),
+            "nfo_files": nfo_paths,
+            "artwork_files": artwork,
+            "confidence": decision_values.get("confidence"),
+            "conflicts": conflicts,
+        },
+        "public_match": public_match or None,
+        "submission": "manual_only",
+    }
 
 
 def redact_url(value: str) -> str:

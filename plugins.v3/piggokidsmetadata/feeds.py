@@ -7,7 +7,9 @@ RSS、种子或磁力链接只存在于一次请求的内存中，由宿主适�
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
+import socket
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -76,6 +78,36 @@ def validate_feed_url(value: str) -> str:
         raise InvalidReferenceError("RSS 地址必须是有效的 HTTP 或 HTTPS URL")
     if parts.username or parts.password:
         raise InvalidReferenceError("RSS 地址不允许在 URL 中嵌入用户名或密码")
+    return text
+
+
+def validate_public_http_url(value: str, *, resolver: Any = None) -> str:
+    """拒绝会把宿主网络客户端引向本机、内网或保留地址的 URL。"""
+
+    text = validate_feed_url(value)
+    parts = urlsplit(text)
+    hostname = str(parts.hostname or "").casefold().rstrip(".")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise InvalidReferenceError("URL 不允许访问本机或内网地址")
+    addresses: set[str] = set()
+    try:
+        addresses.add(str(ipaddress.ip_address(hostname)))
+    except ValueError:
+        lookup = resolver or socket.getaddrinfo
+        try:
+            for record in lookup(hostname, parts.port or None, type=socket.SOCK_STREAM):
+                if len(record) >= 5 and record[4]:
+                    addresses.add(str(record[4][0]))
+        except (OSError, socket.gaierror) as error:
+            raise InvalidReferenceError("URL 主机名无法安全解析") from error
+    if not addresses:
+        raise InvalidReferenceError("URL 主机名无法安全解析")
+    for address in addresses:
+        try:
+            if not ipaddress.ip_address(address).is_global:
+                raise InvalidReferenceError("URL 不允许访问本机、内网或保留地址")
+        except ValueError as error:
+            raise InvalidReferenceError("URL 主机名解析结果无效") from error
     return text
 
 

@@ -138,7 +138,7 @@ https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/package.v
 - 目标：PigGo RSS/链接下载、下载后本地元数据扫描、`piggokids` 媒体身份、MoviePilot 自动整理和媒体库刷新。
 - 版本：V2 / V3 双版本支持。
 - 需求基线：`docs/PigGoKidsMetadata_Product_Requirements.md`
-- 当前状态：本地开发版已推进到 `0.2.0`。V2/V3 均已实现安全 RSS/Atom 候选、粘贴链接、显式下载提交、hash 跟踪、下载轮询恢复、整理完成/失败事件、下载后扫描和默认关闭的可选整理；V3 继续提供 `piggokids` 来源，V2 通过本地 MediaInfo 调用整理链。已通过本地纯逻辑与轻量宿主合同测试，尚未使用真实 PigGo RSS 或真实 MoviePilot V2/V3 实例完成端到端验收，也尚未提交或推送。
+- 当前状态：本地开发版已推进到 `0.3.0`。V2/V3 均已实现安全 RSS/Atom 候选、粘贴链接、显式下载提交、hash 跟踪、下载轮询恢复、逐文件整理结算、下载后扫描、只读 TMDb 严格匹配、只读贡献草稿和默认关闭的可选整理；V3 继续提供 `piggokids` 来源，V2 通过本地 MediaInfo 调用整理链。已通过本地纯逻辑与轻量宿主合同测试，尚未使用真实 PigGo RSS 或真实 MoviePilot V2/V3 实例完成端到端验收。`0.2.0` 基线已有本地提交，`0.3.0` 变更仍未提交或推送。
 
 ## 9. 后续开发检查清单
 

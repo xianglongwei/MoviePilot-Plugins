@@ -28,6 +28,23 @@ feeds = _load_module(f"{PACKAGE_NAME}.feeds", PLUGIN_DIR / "feeds.py")
 
 
 class FeedParsingTest(unittest.TestCase):
+    def test_public_url_validation_blocks_local_and_private_targets(self):
+        public = lambda *_args, **_kwargs: [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]
+        private = lambda *_args, **_kwargs: [
+            (2, 1, 6, "", ("192.168.1.20", 443)),
+        ]
+        self.assertEqual(
+            feeds.validate_public_http_url("https://piggo.example/rss", resolver=public),
+            "https://piggo.example/rss",
+        )
+        for url in ("http://127.0.0.1/rss", "http://localhost/rss"):
+            with self.assertRaises(feeds.InvalidReferenceError):
+                feeds.validate_public_http_url(url, resolver=public)
+        with self.assertRaises(feeds.InvalidReferenceError):
+            feeds.validate_public_http_url("https://piggo.example/rss", resolver=private)
+
     def test_rss_is_parsed_without_persisting_private_reference(self):
         xml = b"""<?xml version="1.0"?>
         <rss><channel><item>

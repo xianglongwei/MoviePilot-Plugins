@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote, urljoin, urlsplit
 
 from app import schemas
 from app.plugins import _PluginBase
@@ -14,17 +16,21 @@ from app.sdk.logging import logger
 
 from .core import (
     MEDIA_SOURCE,
+    VIDEO_EXTENSIONS,
     ImportTask,
     MediaKind,
     PigGoCoreError,
     ScanPolicy,
     TaskState,
+    build_contribution_draft,
+    evaluate_public_media_match,
     inspect_downloaded_payload,
     normalize_download_hash,
     normalize_site_item_id,
     normalize_title,
 )
 from .feeds import (
+    MAX_FEED_BYTES,
     CandidateStatus,
     FeedCandidate,
     InvalidReferenceError,
@@ -35,6 +41,7 @@ from .feeds import (
     upsert_candidates,
     utc_now,
     validate_download_reference,
+    validate_public_http_url,
 )
 
 
@@ -55,7 +62,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.3.0"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -71,6 +78,7 @@ class PigGoKidsMetadata(_PluginBase):
     _downloader = ""
     _download_save_path = ""
     _auto_transfer = False
+    _public_match_enabled = True
     _config_error: Optional[str] = None
 
     def init_plugin(self, config: Optional[dict[str, Any]] = None) -> None:
@@ -82,7 +90,10 @@ class PigGoKidsMetadata(_PluginBase):
         self._downloader = str(values.get("downloader") or "").strip()
         self._download_save_path = str(values.get("download_save_path") or "").strip()
         self._auto_transfer = bool(values.get("auto_transfer", False))
+        self._public_match_enabled = bool(values.get("public_match_enabled", True))
         self._config_error = None
+        self._state_lock = threading.RLock()
+        self._submission_lock = threading.RLock()
         self._candidate_download_references: dict[str, str] = {}
         self._active_submission_task_id: Optional[str] = None
         try:
@@ -142,6 +153,14 @@ class PigGoKidsMetadata(_PluginBase):
                 "response_model": response_model,
             },
             {
+                "path": "/contribution-drafts",
+                "endpoint": self.api_contribution_drafts,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "生成只读 TMDb 贡献草稿",
+                "response_model": response_model,
+            },
+            {
                 "path": "/scan",
                 "endpoint": self.api_scan,
                 "methods": ["POST"],
@@ -182,6 +201,14 @@ class PigGoKidsMetadata(_PluginBase):
                 "response_model": response_model,
             },
             {
+                "path": "/candidates/download-action",
+                "endpoint": self.api_download_candidate_action,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "从插件详情页下载候选资源",
+                "response_model": response_model,
+            },
+            {
                 "path": "/tasks",
                 "endpoint": self.api_tasks,
                 "methods": ["GET"],
@@ -195,6 +222,14 @@ class PigGoKidsMetadata(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "重试扫描或整理任务",
+                "response_model": response_model,
+            },
+            {
+                "path": "/tasks/retry-action",
+                "endpoint": self.api_retry_task_action,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "从插件详情页重试任务",
                 "response_model": response_model,
             },
         ]
@@ -211,7 +246,7 @@ class PigGoKidsMetadata(_PluginBase):
                         "props": {
                             "type": "info",
                             "variant": "tonal",
-                            "text": "阶段二支持 RSS 候选和手工发起下载。完整私密链接不会写入候选记录；自动整理默认关闭。",
+                            "text": "阶段三开始支持只读 TMDb 精确匹配。完整私密链接不会写入候选记录；自动整理默认关闭。",
                         },
                     },
                     {
@@ -265,6 +300,13 @@ class PigGoKidsMetadata(_PluginBase):
                         },
                     },
                     {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "public_match_enabled",
+                            "label": "优先尝试 TMDb 精确匹配（只读）",
+                        },
+                    },
+                    {
                         "component": "VTextField",
                         "props": {
                             "model": "scan_root",
@@ -304,23 +346,80 @@ class PigGoKidsMetadata(_PluginBase):
             "downloader": "",
             "download_save_path": "",
             "auto_transfer": False,
+            "public_match_enabled": True,
             "scan_root": "",
             "minimum_confidence": 0.80,
             "max_files": 10_000,
         }
 
     def get_page(self) -> list[dict[str, Any]]:
-        """展示阶段二候选、任务与最近识别摘要。"""
+        """展示候选、任务与最近识别摘要。"""
 
         tasks = self._load_tasks()
         last_task = tasks[-1] if tasks else None
         candidates = self._load_candidates()
+        drafts = self._contribution_drafts()
+        tasks_by_id = {str(item.get("task_id") or ""): item for item in tasks}
         summary = "尚未产生下载或扫描任务。"
         if last_task:
             summary = (
                 f"最近任务状态：{last_task.get('state', 'UNKNOWN')}；"
                 f"媒体身份：{last_task.get('media_id') or '未生成'}"
             )
+        candidate_content: list[dict[str, Any]] = [
+            {"component": "VCardTitle", "text": "候选资源"},
+            {
+                "component": "VBtn",
+                "props": {"color": "primary", "variant": "tonal", "class": "ma-3"},
+                "text": "立即刷新 RSS",
+                "events": {
+                    "click": {
+                        "api": "plugin/PigGoKidsMetadata/candidates/refresh",
+                        "method": "post",
+                    }
+                },
+            },
+        ]
+        for item in reversed(candidates[-20:]):
+            candidate_content.append({
+                "component": "VCardText",
+                "text": f"{item.title}｜{item.media_type.value}｜{item.status.value}",
+            })
+            task = tasks_by_id.get(str(item.task_id or ""))
+            if task and task.get("state") in {
+                TaskState.RETRYABLE_FAILED.value,
+                TaskState.READY_TO_TRANSFER.value,
+            }:
+                candidate_content.append({
+                    "component": "VBtn",
+                    "props": {"size": "small", "variant": "outlined", "class": "mx-4 mb-3"},
+                    "text": "重试任务",
+                    "events": {"click": {
+                        "api": (
+                            "plugin/PigGoKidsMetadata/tasks/retry-action?task_id="
+                            f"{quote(str(item.task_id), safe='')}"
+                        ),
+                        "method": "post",
+                    }},
+                })
+            elif item.status == CandidateStatus.DISCOVERED:
+                candidate_content.append({
+                    "component": "VBtn",
+                    "props": {"size": "small", "color": "primary", "class": "mx-4 mb-3"},
+                    "text": "选择并下载",
+                    "events": {"click": {
+                        "api": (
+                            "plugin/PigGoKidsMetadata/candidates/download-action?candidate_id="
+                            f"{quote(item.candidate_id, safe='')}"
+                        ),
+                        "method": "post",
+                    }},
+                })
+        if not candidates:
+            candidate_content.append({
+                "component": "VCardText",
+                "text": "尚无候选，请配置 RSS 后点击刷新。",
+            })
         return [
             {
                 "component": "VAlert",
@@ -328,7 +427,8 @@ class PigGoKidsMetadata(_PluginBase):
                     "type": "success" if self._enabled and self._scan_root else "warning",
                     "variant": "tonal",
                     "text": (
-                        f"阶段二已启用：{len(candidates)} 个候选，{len(tasks)} 个任务。"
+                        f"阶段三已启用：{len(candidates)} 个候选，{len(tasks)} 个任务，"
+                        f"{len(drafts)} 份只读贡献草稿。"
                         if self._enabled
                         else "请先启用插件并配置下载根目录。"
                     ),
@@ -345,16 +445,7 @@ class PigGoKidsMetadata(_PluginBase):
             {
                 "component": "VCard",
                 "props": {"variant": "tonal", "class": "mt-3"},
-                "content": [
-                    {"component": "VCardTitle", "text": "候选资源"},
-                    {
-                        "component": "VCardText",
-                        "text": "\n".join(
-                            f"• {item.title}（{item.status.value}）"
-                            for item in candidates[-10:]
-                        ) or "尚无候选，请配置 RSS 后手工刷新。",
-                    },
-                ],
+                "content": candidate_content,
             },
         ]
 
@@ -443,10 +534,11 @@ class PigGoKidsMetadata(_PluginBase):
         return candidates
 
     def _save_candidates(self, candidates: list[FeedCandidate]) -> None:
-        self.save_data(
-            CANDIDATES_KEY,
-            [item.to_dict() for item in candidates[-MAX_CANDIDATE_ITEMS:]],
-        )
+        with self._state_lock:
+            self.save_data(
+                CANDIDATES_KEY,
+                [item.to_dict() for item in candidates[-MAX_CANDIDATE_ITEMS:]],
+            )
 
     def _save_feed_status(self, status: dict[str, dict[str, Any]]) -> None:
         """保存不含原始 RSS URL 和响应正文的抓取状态。"""
@@ -458,16 +550,18 @@ class PigGoKidsMetadata(_PluginBase):
         return dict(raw) if isinstance(raw, dict) else {}
 
     def _save_registry_item(self, item: dict[str, Any]) -> None:
-        registry = self._load_registry()
-        registry[str(item["media_id"])] = item
-        if len(registry) > MAX_REGISTRY_ITEMS:
-            registry = dict(list(registry.items())[-MAX_REGISTRY_ITEMS:])
-        self.save_data(REGISTRY_KEY, registry)
+        with self._state_lock:
+            registry = self._load_registry()
+            registry[str(item["media_id"])] = item
+            if len(registry) > MAX_REGISTRY_ITEMS:
+                registry = dict(list(registry.items())[-MAX_REGISTRY_ITEMS:])
+            self.save_data(REGISTRY_KEY, registry)
 
     def _save_task(self, task: ImportTask) -> None:
-        tasks = [item for item in self._load_tasks() if item.get("task_id") != task.task_id]
-        tasks.append(task.to_dict())
-        self.save_data(TASKS_KEY, tasks[-MAX_REGISTRY_ITEMS:])
+        with self._state_lock:
+            tasks = [item for item in self._load_tasks() if item.get("task_id") != task.task_id]
+            tasks.append(task.to_dict())
+            self.save_data(TASKS_KEY, tasks[-MAX_REGISTRY_ITEMS:])
 
     def _find_task(self, task_id: str) -> Optional[ImportTask]:
         for item in reversed(self._load_tasks()):
@@ -493,36 +587,77 @@ class PigGoKidsMetadata(_PluginBase):
     ) -> None:
         if not candidate_id:
             return
-        candidates = self._load_candidates()
-        for item in candidates:
-            if item.candidate_id == candidate_id:
-                item.status = status
-                if task_id:
-                    item.task_id = task_id
-                self._save_candidates(candidates)
-                return
+        with self._state_lock:
+            candidates = self._load_candidates()
+            for item in candidates:
+                if item.candidate_id == candidate_id:
+                    item.status = status
+                    if task_id:
+                        item.task_id = task_id
+                    self._save_candidates(candidates)
+                    return
 
     def _save_decision(self, task_id: str, decision: dict[str, Any]) -> None:
-        decisions = self._load_decisions()
-        decisions[task_id] = decision
-        if len(decisions) > MAX_REGISTRY_ITEMS:
-            decisions = dict(list(decisions.items())[-MAX_REGISTRY_ITEMS:])
-        self.save_data(DECISIONS_KEY, decisions)
+        with self._state_lock:
+            decisions = self._load_decisions()
+            decisions[task_id] = decision
+            if len(decisions) > MAX_REGISTRY_ITEMS:
+                decisions = dict(list(decisions.items())[-MAX_REGISTRY_ITEMS:])
+            self.save_data(DECISIONS_KEY, decisions)
 
     @staticmethod
     def _fetch_feed_content(url: str) -> tuple[bytes, int]:
-        """使用宿主 HTTP 客户端抓取 RSS，不把 URL 交给插件日志。"""
+        """流式抓取公开 RSS，并在分配大块内存前执行大小限制。"""
 
         from app.sdk.network import RequestUtils
 
-        response = RequestUtils(timeout=20).get_res(url)
-        if response is None:
-            raise PigGoCoreError("RSS 请求没有返回响应")
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        if status_code != 200:
-            raise PigGoCoreError(f"RSS 请求返回 HTTP {status_code or 'unknown'}")
-        content = bytes(getattr(response, "content", b"") or b"")
-        return content, status_code
+        current_url = url
+        for _ in range(6):
+            validate_public_http_url(current_url)
+            response = RequestUtils(timeout=20).get_res(
+                current_url,
+                stream=True,
+                allow_redirects=False,
+            )
+            if response is None:
+                raise PigGoCoreError("RSS 请求没有返回响应")
+            try:
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if status_code in {301, 302, 303, 307, 308}:
+                    location = str((getattr(response, "headers", {}) or {}).get("Location") or "")
+                    if not location:
+                        raise PigGoCoreError("RSS 重定向缺少目标地址")
+                    current_url = urljoin(current_url, location)
+                    continue
+                if status_code != 200:
+                    raise PigGoCoreError(f"RSS 请求返回 HTTP {status_code or 'unknown'}")
+                headers = getattr(response, "headers", {}) or {}
+                try:
+                    content_length = int(headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    content_length = 0
+                if content_length > MAX_FEED_BYTES:
+                    raise PigGoCoreError("RSS 内容超过安全大小限制")
+                chunks: list[bytes] = []
+                total = 0
+                iterator = getattr(response, "iter_content", None)
+                source = (
+                    iterator(chunk_size=64 * 1024)
+                    if callable(iterator)
+                    else [getattr(response, "content", b"")]
+                )
+                for chunk in source:
+                    data = bytes(chunk or b"")
+                    total += len(data)
+                    if total > MAX_FEED_BYTES:
+                        raise PigGoCoreError("RSS 内容超过安全大小限制")
+                    chunks.append(data)
+                return b"".join(chunks), status_code
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+        raise PigGoCoreError("RSS 重定向次数过多")
 
     def refresh_candidates(self) -> dict[str, Any]:
         """拉取全部 RSS，幂等更新候选并仅在内存保留私密下载引用。"""
@@ -609,6 +744,8 @@ class PigGoKidsMetadata(_PluginBase):
     def _submit_download_to_host(self, candidate: FeedCandidate, reference: str) -> Any:
         """通过 MoviePilot 公共下载链提交一个未识别候选。"""
 
+        if urlsplit(reference).scheme.casefold() in {"http", "https"}:
+            validate_public_http_url(reference)
         from app.chain.download import DownloadChain
         from app.domain.context import Context, MediaInfo, TorrentInfo
         from app.domain.metainfo import MetaInfo
@@ -648,10 +785,22 @@ class PigGoKidsMetadata(_PluginBase):
     def _download_result_id(result: Any) -> Optional[str]:
         if isinstance(result, dict):
             result = result.get("download_id") or result.get("hash") or result.get("id")
+        if isinstance(result, tuple):
+            result = result[0] if result else None
         text = str(result or "").strip()
         return text[:256] or None
 
     def _submit_candidate_download(
+        self,
+        candidate: FeedCandidate,
+        reference: str,
+    ) -> tuple[bool, ImportTask, str]:
+        """串行化提交窗口，避免同步 DownloadAdded 事件跨请求串单。"""
+
+        with self._submission_lock:
+            return self._submit_candidate_download_locked(candidate, reference)
+
+    def _submit_candidate_download_locked(
         self,
         candidate: FeedCandidate,
         reference: str,
@@ -665,6 +814,10 @@ class PigGoKidsMetadata(_PluginBase):
                 TaskState.IGNORED,
             }:
                 return True, existing, "任务已经存在"
+            if existing and existing.state == TaskState.RETRYABLE_FAILED and (
+                existing.download_hash or existing.download_id or existing.relative_source_path
+            ):
+                return False, existing, "下载阶段已经完成，请从任务列表重试扫描或整理"
         task_id = hashlib.sha256(f"candidate:{candidate.candidate_id}".encode("utf-8")).hexdigest()[:24]
         task = self._find_task(task_id) or ImportTask(
             task_id=task_id,
@@ -833,6 +986,118 @@ class PigGoKidsMetadata(_PluginBase):
         except (OSError, RuntimeError, ValueError):
             return None
 
+    def _transfer_event_file_key(self, task: ImportTask, data: dict[str, Any]) -> Optional[str]:
+        """把宿主绝对文件路径映射为任务预期的安全相对文件键。"""
+
+        fileitem = data.get("fileitem")
+        raw_path = getattr(fileitem, "path", None)
+        relative: Optional[str] = None
+        if self._scan_root and raw_path:
+            try:
+                root = Path(self._scan_root).expanduser().resolve(strict=True)
+                candidate = Path(str(raw_path)).expanduser().resolve(strict=True)
+                relative = candidate.relative_to(root).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                relative = None
+        expected = set(task.transfer_expected_files) or {
+            Path(item).as_posix()
+            for item in task.torrent_files
+            if Path(item).suffix.casefold() in VIDEO_EXTENSIONS
+        }
+        if relative:
+            if relative in expected:
+                return relative
+            suffix_matches = [item for item in expected if relative.endswith(f"/{item}")]
+            if len(suffix_matches) == 1:
+                return suffix_matches[0]
+            basename_matches = [item for item in expected if Path(item).name == Path(relative).name]
+            if len(basename_matches) == 1:
+                return basename_matches[0]
+        history_id = data.get("transfer_history_id")
+        identity = str(history_id or raw_path or "").strip()
+        if not identity:
+            return None
+        return f"event:{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+
+    def _record_transfer_result(
+        self,
+        task: ImportTask,
+        data: dict[str, Any],
+        *,
+        success: bool,
+    ) -> bool:
+        """记录单文件整理结果；仅在全部预期媒体文件成功时返回完成。"""
+
+        key = self._transfer_event_file_key(task, data)
+        if key:
+            completed = set(task.transfer_completed_files)
+            failed = set(task.transfer_failed_files)
+            if success:
+                completed.add(key)
+                failed.discard(key)
+            else:
+                failed.add(key)
+                completed.discard(key)
+            task.transfer_completed_files = sorted(completed)
+            task.transfer_failed_files = sorted(failed)
+        self._save_task(task)
+        expected = set(task.transfer_expected_files) or {
+            Path(item).as_posix()
+            for item in task.torrent_files
+            if Path(item).suffix.casefold() in VIDEO_EXTENSIONS
+        }
+        return bool(
+            expected
+            and expected.issubset(task.transfer_completed_files)
+            and not task.transfer_failed_files
+        )
+
+    def _apply_public_match(self, decision: Any) -> None:
+        """通过 MoviePilot 的 TMDb 读取链尝试精确匹配，失败时保留本地身份。"""
+
+        if not self._public_match_enabled or not decision.item or not decision.auto_eligible:
+            return
+        try:
+            from app.chain.media import MediaChain
+            from app.domain.metainfo import MetaInfo
+
+            meta = MetaInfo(decision.item.title)
+            meta.year = decision.item.year
+            meta.type = (
+                MediaType.TV
+                if decision.item.media_type == MediaKind.TV
+                else MediaType.MOVIE
+            )
+            if decision.item.season is not None:
+                meta.begin_season = decision.item.season
+            candidate = MediaChain().recognize_by_meta(
+                meta,
+                media_source=MediaSource.TMDB,
+                obtain_images=False,
+            )
+        except Exception:
+            decision.public_match = {
+                "exact": False,
+                "confidence": 0.0,
+                "reasons": ["public_lookup_unavailable"],
+            }
+            return
+        if not candidate:
+            decision.public_match = {
+                "exact": False,
+                "confidence": 0.0,
+                "reasons": ["public_match_not_found"],
+            }
+            return
+        evaluation = evaluate_public_media_match(decision.item, candidate)
+        decision.public_match = evaluation
+        if not evaluation["exact"]:
+            return
+        decision.item.media_source = str(evaluation["media_source"])
+        decision.item.media_id = str(evaluation["media_id"])
+        decision.item.source_fields["media_source"] = "moviepilot_public_exact"
+        decision.item.source_fields["media_id"] = "moviepilot_public_exact"
+
     def _scan_task(
         self,
         task: ImportTask,
@@ -860,11 +1125,21 @@ class PigGoKidsMetadata(_PluginBase):
                 minimum_confidence=self._minimum_confidence,
                 policy=ScanPolicy(max_files=self._max_files),
             )
+            self._apply_public_match(decision)
             if task.state == TaskState.SCANNING:
                 task.transition(TaskState.MATCHING, "payload_scanned")
             if decision.item:
                 task.media_id = decision.item.media_id
-            if decision.item and decision.auto_eligible:
+            source_prefix = Path(task.relative_source_path)
+            task.transfer_expected_files = sorted({
+                (source_prefix / relative).as_posix()
+                for relative in decision.payload.media_files
+            })
+            if (
+                decision.item
+                and decision.auto_eligible
+                and decision.item.media_source == MEDIA_SOURCE
+            ):
                 self._save_registry_item(decision.item.to_dict())
             if task.state == TaskState.MATCHING:
                 task.transition(
@@ -874,6 +1149,11 @@ class PigGoKidsMetadata(_PluginBase):
             task.last_error_code = None
             self._save_decision(task.task_id, decision.to_dict())
             self._save_task(task)
+            self._update_candidate(
+                task.candidate_id,
+                status=CandidateStatus.SELECTED,
+                task_id=task.task_id,
+            )
             if decision.auto_eligible and allow_auto_transfer and self._auto_transfer:
                 self._start_host_transfer(task, decision.to_dict())
             return True, decision.to_dict(), "内容包识别完成"
@@ -899,6 +1179,7 @@ class PigGoKidsMetadata(_PluginBase):
         item = dict(decision.get("item") or {})
         kind = str(item.get("media_type") or "")
         mtype = MediaType.TV if kind == MediaKind.TV.value else MediaType.MOVIE
+        media_source = MediaSource(str(item.get("media_source") or MEDIA_SOURCE))
         source = (
             Path(self._scan_root).expanduser().resolve(strict=True)
             / str(task.relative_source_path or "")
@@ -914,7 +1195,7 @@ class PigGoKidsMetadata(_PluginBase):
         )
         return TransferChain().manual_transfer(
             fileitem=fileitem,
-            media_source=PLUGIN_SOURCE,
+            media_source=media_source,
             media_id=str(item.get("media_id") or task.media_id or ""),
             mtype=mtype,
             season=item.get("season"),
@@ -933,8 +1214,15 @@ class PigGoKidsMetadata(_PluginBase):
         if task.state != TaskState.READY_TO_TRANSFER:
             return False, "任务尚未达到可整理状态"
         try:
+            task.transfer_completed_files = []
+            task.transfer_failed_files = []
             task.transition(TaskState.TRANSFERRING, "auto_transfer_enabled")
             self._save_task(task)
+            self._update_candidate(
+                task.candidate_id,
+                status=CandidateStatus.DOWNLOADING,
+                task_id=task.task_id,
+            )
             success, result = self._submit_transfer_to_host(task, decision)
             if not success:
                 task.transition(TaskState.RETRYABLE_FAILED, "host_transfer_rejected")
@@ -966,7 +1254,8 @@ class PigGoKidsMetadata(_PluginBase):
         if task.state == TaskState.SCANNING:
             task.transition(TaskState.MATCHING, "host_pipeline_complete")
         if task.state == TaskState.NEEDS_REVIEW:
-            task.transition(TaskState.READY_TO_TRANSFER, "host_pipeline_complete")
+            self._save_task(task)
+            return
         if task.state == TaskState.MATCHING:
             task.transition(TaskState.READY_TO_TRANSFER, "host_pipeline_complete")
         if task.state == TaskState.RETRYABLE_FAILED:
@@ -1008,22 +1297,30 @@ class PigGoKidsMetadata(_PluginBase):
     def on_transfer_complete(self, event: Event) -> None:
         """按下载 hash 幂等结算宿主整理完成事件。"""
 
-        if not self._enabled:
-            return
-        task = self._find_task_by_hash(self._event_data(event).get("download_hash"))
-        if task and task.state not in {TaskState.COMPLETED, TaskState.IGNORED}:
-            self._advance_host_completed(task)
+        with self._state_lock:
+            if not self._enabled:
+                return
+            data = self._event_data(event)
+            task = self._find_task_by_hash(data.get("download_hash"))
+            if task and task.state not in {TaskState.COMPLETED, TaskState.IGNORED}:
+                if self._record_transfer_result(task, data, success=True):
+                    self._advance_host_completed(task)
 
     @eventmanager.register(EventType.TransferFailed)
     def on_transfer_failed(self, event: Event) -> None:
         """整理失败后定位真实内容包并生成可重试的本地识别决策。"""
 
+        with self._state_lock:
+            self._on_transfer_failed_locked(event)
+
+    def _on_transfer_failed_locked(self, event: Event) -> None:
         if not self._enabled:
             return
         data = self._event_data(event)
         task = self._find_task_by_hash(data.get("download_hash"))
         if not task or task.state in {TaskState.COMPLETED, TaskState.IGNORED}:
             return
+        self._record_transfer_result(task, data, success=False)
         fileitem = data.get("fileitem")
         relative = self._relative_source_from_host_path(getattr(fileitem, "path", None))
         if relative:
@@ -1112,6 +1409,7 @@ class PigGoKidsMetadata(_PluginBase):
     def api_status(self) -> schemas.Response[dict[str, Any]]:
         """返回不含绝对路径的运行摘要。"""
 
+        drafts = self._contribution_drafts()
         return schemas.Response(
             success=True,
             data={
@@ -1121,6 +1419,7 @@ class PigGoKidsMetadata(_PluginBase):
                 "registry_count": len(self._load_registry()),
                 "task_count": len(self._load_tasks()),
                 "decision_count": len(self._load_decisions()),
+                "contribution_draft_count": len(drafts),
                 "candidate_count": len(self._load_candidates()),
                 "rss_feed_count": len(self._rss_urls),
                 "rss_configured": bool(self._rss_urls),
@@ -1128,8 +1427,9 @@ class PigGoKidsMetadata(_PluginBase):
                 "downloader_configured": bool(self._downloader),
                 "download_save_path_configured": bool(self._download_save_path),
                 "auto_transfer": self._auto_transfer,
+                "public_match_enabled": self._public_match_enabled,
                 "config_error": self._config_error,
-                "phase": 2,
+                "phase": 3,
             },
         )
 
@@ -1141,6 +1441,21 @@ class PigGoKidsMetadata(_PluginBase):
             "items": list(registry.values()),
             "decisions": list(self._load_decisions().values()),
         })
+
+    def _contribution_drafts(self) -> list[dict[str, Any]]:
+        tasks = {str(item.get("task_id") or ""): item for item in self._load_tasks()}
+        drafts = []
+        for task_id, decision in self._load_decisions().items():
+            draft = build_contribution_draft(tasks.get(task_id, {"task_id": task_id}), decision)
+            if draft:
+                drafts.append(draft)
+        return drafts
+
+    def api_contribution_drafts(self) -> schemas.Response[dict[str, Any]]:
+        """返回只读草稿；提交 TMDb 必须由用户在官方网站手工完成。"""
+
+        drafts = self._contribution_drafts()
+        return schemas.Response(success=True, data={"items": drafts, "total": len(drafts)})
 
     def api_candidates(
         self,
@@ -1159,6 +1474,7 @@ class PigGoKidsMetadata(_PluginBase):
         except (TypeError, ValueError):
             safe_limit = 100
         items = []
+        total = 0
         for item in reversed(self._load_candidates()):
             if normalized_query and normalized_query not in normalize_title(item.title):
                 continue
@@ -1166,10 +1482,10 @@ class PigGoKidsMetadata(_PluginBase):
                 continue
             if type_value and item.media_type.value != type_value:
                 continue
-            items.append(item.to_dict())
-            if len(items) >= safe_limit:
-                break
-        return schemas.Response(success=True, data={"items": items, "total": len(items)})
+            total += 1
+            if len(items) < safe_limit:
+                items.append(item.to_dict())
+        return schemas.Response(success=True, data={"items": items, "total": total})
 
     def api_refresh_candidates(self, payload: Optional[dict[str, Any]] = None) -> schemas.Response[dict[str, Any]]:
         """手工刷新 RSS；请求体保留用于未来按来源刷新。"""
@@ -1214,8 +1530,9 @@ class PigGoKidsMetadata(_PluginBase):
             return schemas.Response(success=False, message="插件尚未启用", data={})
         values = dict(payload or {})
         candidate_id = str(values.get("candidate_id") or "").strip()
+        candidates = self._load_candidates()
         candidate = next(
-            (item for item in self._load_candidates() if item.candidate_id == candidate_id),
+            (item for item in candidates if item.candidate_id == candidate_id),
             None,
         )
         if not candidate:
@@ -1226,6 +1543,7 @@ class PigGoKidsMetadata(_PluginBase):
                 candidate.media_type = MediaKind(str(media_type).casefold())
             except ValueError:
                 return schemas.Response(success=False, message="媒体类型无效", data={})
+            self._save_candidates(candidates)
         try:
             reference = self._resolve_candidate_reference(
                 candidate,
@@ -1241,6 +1559,11 @@ class PigGoKidsMetadata(_PluginBase):
             )
         success, task, message = self._submit_candidate_download(candidate, reference)
         return schemas.Response(success=success, message=message, data={"task": task.to_dict()})
+
+    def api_download_candidate_action(self, candidate_id: str = "") -> schemas.Response[dict[str, Any]]:
+        """为 Vuetify 详情页提供不需要构造 JSON 请求体的下载动作。"""
+
+        return self.api_download_candidate({"candidate_id": candidate_id})
 
     def api_tasks(self) -> schemas.Response[dict[str, Any]]:
         """返回不含绝对路径和私密引用的任务记录。"""
@@ -1277,6 +1600,11 @@ class PigGoKidsMetadata(_PluginBase):
             data={"task": task.to_dict()},
         )
 
+    def api_retry_task_action(self, task_id: str = "") -> schemas.Response[dict[str, Any]]:
+        """为 Vuetify 详情页提供不需要构造 JSON 请求体的重试动作。"""
+
+        return self.api_retry_task({"task_id": task_id})
+
     def api_scan(self, payload: dict[str, Any]) -> schemas.Response[dict[str, Any]]:
         """手工扫描一个相对目录，生成决策并持久化可用本地身份。"""
 
@@ -1309,10 +1637,20 @@ class PigGoKidsMetadata(_PluginBase):
                 minimum_confidence=self._minimum_confidence,
                 policy=ScanPolicy(max_files=self._max_files),
             )
+            self._apply_public_match(decision)
             task.transition(TaskState.MATCHING, "payload_scanned")
             if decision.item:
                 task.media_id = decision.item.media_id
-            if decision.item and decision.auto_eligible:
+            source_prefix = Path(relative_path)
+            task.transfer_expected_files = sorted({
+                (source_prefix / relative).as_posix()
+                for relative in decision.payload.media_files
+            })
+            if (
+                decision.item
+                and decision.auto_eligible
+                and decision.item.media_source == MEDIA_SOURCE
+            ):
                 self._save_registry_item(decision.item.to_dict())
             task.transition(
                 TaskState.READY_TO_TRANSFER if decision.auto_eligible else TaskState.NEEDS_REVIEW,
