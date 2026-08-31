@@ -255,6 +255,8 @@ class FeedCandidate:
     detail_url: Optional[str] = None
     download_url: Optional[str] = None
     task_id: Optional[str] = None
+    title_overridden: bool = False
+    media_type_overridden: bool = False
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
@@ -340,6 +342,11 @@ def parse_feed_document(
         if not title:
             continue
         detail, download, enclosure_size = _entry_links(entry)
+        if detail:
+            try:
+                detail = validate_feed_url(detail)
+            except InvalidReferenceError:
+                detail = ""
         try:
             download = validate_download_reference(download)
         except InvalidReferenceError:
@@ -433,6 +440,12 @@ def upsert_candidates(
         if previous:
             item.status = previous.status
             item.task_id = previous.task_id
+            item.title_overridden = previous.title_overridden
+            item.media_type_overridden = previous.media_type_overridden
+            if previous.title_overridden:
+                item.title = previous.title
+            if previous.media_type_overridden:
+                item.media_type = previous.media_type
             item.created_at = previous.created_at
         item.updated_at = utc_now()
         merged[item.candidate_id] = item

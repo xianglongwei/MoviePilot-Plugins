@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -126,10 +127,62 @@ class V2PluginContractTest(unittest.TestCase):
             self.assertTrue(response["data"]["decision"]["transfer_preview"])
             self.assertEqual({item["auth"] for item in plugin.get_api()}, {"bear"})
             self.assertEqual({item["path"] for item in plugin.get_api()}, {
-                "/status", "/registry", "/contribution-drafts", "/scan", "/candidates",
-                "/candidates/refresh", "/candidates/import", "/candidates/download",
-                "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/retry-action",
+                "/status", "/registry", "/feeds", "/contribution-drafts", "/scan", "/candidates",
+                "/candidates/refresh", "/candidates/import", "/candidates/ignore", "/candidates/update",
+                "/candidates/download",
+                "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/review",
+                "/tasks/retry-action",
             })
+            self.assertEqual(plugin.get_render_mode(), ("vuetify", ""))
+            self.assertEqual(plugin.get_sidebar_nav(), [])
+            with mock.patch.object(self.module.Path, "is_file", return_value=True):
+                self.assertEqual(plugin.get_render_mode(), ("vue", "dist/assets"))
+                self.assertEqual(plugin.get_sidebar_nav()[0]["nav_key"], "main")
+
+    def test_feed_status_drops_private_query_parameters(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        plugin.save_data(self.module.FEED_STATUS_KEY, {
+            "feed:one": {
+                "feed_id": "feed:one",
+                "url": "https://piggo.example/rss.php?passkey=never-expose-this&uid=7",
+                "last_attempt_at": "2026-08-31T10:00:00+00:00",
+                "last_success_at": "2026-08-31T10:00:00+00:00",
+                "http_status": 200,
+                "parsed_count": 3,
+                "error_code": None,
+            }
+        })
+        response = plugin.api_feeds()
+        self.assertTrue(response["success"])
+        self.assertEqual(response["data"]["items"][0]["source"], "https://piggo.example/rss.php")
+        self.assertNotIn("never-expose-this", json.dumps(response, ensure_ascii=False))
+
+    def test_conflict_review_requires_explicit_transfer_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "Mixed"
+            payload.mkdir()
+            (payload / "Mixed.mkv").write_bytes(b"")
+            (payload / "movie.nfo").write_text(
+                "<movie><title>冲突样例</title><year>2024</year></movie>",
+                encoding="utf-8",
+            )
+            (payload / "tvshow.nfo").write_text(
+                "<tvshow><title>冲突样例</title><year>2024</year></tvshow>",
+                encoding="utf-8",
+            )
+            plugin = self.module.PigGoKidsMetadata()
+            plugin.init_plugin({"enabled": True, "scan_root": str(root)})
+            scanned = plugin.api_scan({"relative_path": "Mixed"})
+            self.assertTrue(scanned["success"])
+            self.assertEqual(scanned["data"]["task"]["state"], "NEEDS_REVIEW")
+            task_id = scanned["data"]["task"]["task_id"]
+            approved = plugin.api_review_task({"task_id": task_id, "action": "approve"})
+            self.assertTrue(approved["success"])
+            self.assertEqual(approved["data"]["task"]["state"], "READY_TO_TRANSFER")
+            self.assertEqual(approved["data"]["decision"]["review"]["action"], "approve")
+            self.assertFalse(plugin.api_review_task({"task_id": task_id, "action": "approve"})["success"])
 
     def test_exact_tmdb_match_reuses_public_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -223,7 +276,72 @@ class V2PluginContractTest(unittest.TestCase):
         self.assertTrue(second["success"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(first["data"]["task"]["state"], "DOWNLOADING")
+        self.assertFalse(plugin.api_ignore_candidate({"candidate_id": candidate_id})["success"])
         self.assertNotIn(secret, json.dumps(plugin._plugin_data, ensure_ascii=False))
+
+    def test_unassigned_candidate_can_be_ignored_and_restored(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        imported = plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "9" * 40,
+            "title": "稍后处理样例",
+        })
+        candidate_id = imported["data"]["candidate"]["candidate_id"]
+        ignored = plugin.api_ignore_candidate({"candidate_id": candidate_id, "ignored": True})
+        self.assertTrue(ignored["success"])
+        self.assertEqual(ignored["data"]["candidate"]["status"], "ignored")
+        restored = plugin.api_ignore_candidate({"candidate_id": candidate_id, "ignored": "false"})
+        self.assertTrue(restored["success"])
+        self.assertEqual(restored["data"]["candidate"]["status"], "discovered")
+
+    def test_unassigned_candidate_identity_can_be_corrected(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        imported = plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "title": "待修正标题",
+        })
+        candidate_id = imported["data"]["candidate"]["candidate_id"]
+        updated = plugin.api_update_candidate({
+            "candidate_id": candidate_id,
+            "title": "  正确 标题  ",
+            "media_type": "movie",
+        })
+        self.assertTrue(updated["success"])
+        self.assertEqual(updated["data"]["candidate"]["candidate_id"], candidate_id)
+        self.assertEqual(updated["data"]["candidate"]["title"], "正确 标题")
+        self.assertEqual(updated["data"]["candidate"]["media_type"], "movie")
+        self.assertTrue(updated["data"]["candidate"]["title_overridden"])
+        self.assertTrue(updated["data"]["candidate"]["media_type_overridden"])
+        self.assertFalse(plugin.api_update_candidate({
+            "candidate_id": candidate_id,
+            "title": "",
+        })["success"])
+
+    def test_retry_resubmits_failed_download_when_reference_is_available(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        imported = plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "e" * 40,
+            "title": "重试下载样例",
+        })
+        candidate_id = imported["data"]["candidate"]["candidate_id"]
+        calls = []
+
+        def submit(*_: Any) -> str:
+            calls.append(True)
+            if len(calls) == 1:
+                raise self.module.PigGoCoreError("下载器暂时不可用")
+            return "e" * 40
+
+        plugin._submit_download_to_host = submit
+        failed = plugin.api_download_candidate({"candidate_id": candidate_id})
+        self.assertFalse(failed["success"])
+        self.assertEqual(failed["data"]["task"]["state"], "RETRYABLE_FAILED")
+        retried = plugin.api_retry_task({"task_id": failed["data"]["task"]["task_id"]})
+        self.assertTrue(retried["success"])
+        self.assertEqual(retried["data"]["task"]["state"], "DOWNLOADING")
+        self.assertEqual(len(calls), 2)
 
     def test_transfer_failure_scans_and_completion_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

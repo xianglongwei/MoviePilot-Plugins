@@ -76,6 +76,16 @@ class FeedParsingTest(unittest.TestCase):
         self.assertEqual(item.candidate.media_type, core.MediaKind.MOVIE)
         self.assertEqual(item.candidate.published_at, "2025-07-01T10:00:00+00:00")
 
+    def test_unsafe_detail_link_is_not_exposed_to_frontend(self):
+        xml = """<rss><channel><item>
+          <title>恶意详情链接样例</title>
+          <link>javascript:alert(document.domain)</link>
+          <enclosure url="https://example.test/download/88" />
+        </item></channel></rss>"""
+        item = feeds.parse_feed_document(xml, source_feed_id="feed:unsafe")[0]
+        self.assertIsNone(item.candidate.detail_url)
+        self.assertEqual(item.candidate.download_url, "https://example.test/download/88")
+
     def test_doctype_and_oversize_are_rejected(self):
         with self.assertRaises(feeds.FeedParseError):
             feeds.parse_feed_document("<!DOCTYPE rss><rss/>", source_feed_id="feed:test")
@@ -98,6 +108,25 @@ class FeedParsingTest(unittest.TestCase):
         self.assertEqual(merged[0].status, feeds.CandidateStatus.DOWNLOADING)
         self.assertEqual(merged[0].task_id, "task-1")
         self.assertEqual(merged[0].title, "Example Updated")
+
+    def test_rss_refresh_preserves_explicit_identity_overrides(self):
+        first = feeds.candidate_from_reference(
+            "https://example.test/download.php?id=8&passkey=abcdefghijklmnopqrstuvwxyz123456",
+            title="人工标题",
+            media_type=core.MediaKind.MOVIE,
+        ).candidate
+        first.title_overridden = True
+        first.media_type_overridden = True
+        updated = feeds.candidate_from_reference(
+            "https://example.test/download.php?id=8&passkey=different-secret-1234567890",
+            title="RSS 新标题 S01E01",
+            media_type=core.MediaKind.TV,
+        ).candidate
+        merged = feeds.upsert_candidates([first], [updated])
+        self.assertEqual(merged[0].title, "人工标题")
+        self.assertEqual(merged[0].media_type, core.MediaKind.MOVIE)
+        self.assertTrue(merged[0].title_overridden)
+        self.assertTrue(merged[0].media_type_overridden)
 
     def test_pasted_magnet_is_validated_and_redacted(self):
         raw = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Kids%20Movie&token=abcdefghijklmnopqrstuvwxyz123456"

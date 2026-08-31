@@ -163,3 +163,9 @@ cython_debug/
 .vscode/
 .DS_Store
 plugins.v2/.DS_Store
+node_modules/
+
+# MoviePilot V2 插件联邦模块需要随插件发布构建产物。
+!plugins.v2/piggokidsmetadata/dist/
+!plugins.v2/piggokidsmetadata/dist/assets/
+!plugins.v2/piggokidsmetadata/dist/assets/**

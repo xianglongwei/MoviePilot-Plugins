@@ -164,10 +164,45 @@ class PluginContractTest(unittest.TestCase):
         apis = self.plugin.get_api()
         self.assertEqual({item["auth"] for item in apis}, {"bear"})
         self.assertEqual({item["path"] for item in apis}, {
-            "/status", "/registry", "/contribution-drafts", "/scan", "/candidates",
-            "/candidates/refresh", "/candidates/import", "/candidates/download",
-            "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/retry-action",
+            "/status", "/registry", "/feeds", "/contribution-drafts", "/scan", "/candidates",
+            "/candidates/refresh", "/candidates/import", "/candidates/ignore", "/candidates/update",
+            "/candidates/download",
+            "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/review",
+            "/tasks/retry-action",
         })
+
+    def test_feed_status_drops_private_query_parameters(self) -> None:
+        self.plugin.save_data(self.module.FEED_STATUS_KEY, {
+            "feed:one": {
+                "feed_id": "feed:one",
+                "url": "https://piggo.example/rss.php?passkey=never-expose-this&uid=7",
+                "last_attempt_at": "2026-08-31T10:00:00+00:00",
+                "last_success_at": "2026-08-31T10:00:00+00:00",
+                "http_status": 200,
+                "parsed_count": 3,
+                "error_code": None,
+            }
+        })
+        response = self.plugin.api_feeds()
+        self.assertTrue(response.success)
+        self.assertEqual(response.data["items"][0]["source"], "https://piggo.example/rss.php")
+        self.assertNotIn("never-expose-this", json.dumps(response.data, ensure_ascii=False))
+
+    def test_conflict_can_be_ignored_with_audit_record(self) -> None:
+        payload = self.root / "KidsMovie"
+        (payload / "tvshow.nfo").write_text(
+            "<tvshow><title>儿童电影</title><year>2024</year></tvshow>",
+            encoding="utf-8",
+        )
+        scanned = self.plugin.api_scan({"relative_path": "KidsMovie"})
+        self.assertTrue(scanned.success)
+        self.assertEqual(scanned.data["task"]["state"], "NEEDS_REVIEW")
+        task_id = scanned.data["task"]["task_id"]
+        ignored = self.plugin.api_review_task({"task_id": task_id, "action": "ignore"})
+        self.assertTrue(ignored.success)
+        self.assertEqual(ignored.data["task"]["state"], "IGNORED")
+        self.assertEqual(ignored.data["decision"]["review"]["action"], "ignore")
+        self.assertFalse(self.plugin.api_review_task({"task_id": task_id, "action": "ignore"}).success)
 
     def test_feed_fetch_stops_after_size_limit(self) -> None:
         response = types.SimpleNamespace(status_code=200, headers={}, closed=False)
@@ -354,7 +389,66 @@ class PluginContractTest(unittest.TestCase):
         self.assertTrue(second.success)
         self.assertEqual(len(calls), 1)
         self.assertEqual(first.data["task"]["state"], "DOWNLOADING")
+        self.assertFalse(self.plugin.api_ignore_candidate({"candidate_id": candidate_id}).success)
         self.assertNotIn(secret, json.dumps(self.plugin._plugin_data, ensure_ascii=False))
+
+    def test_unassigned_candidate_can_be_ignored_and_restored(self) -> None:
+        imported = self.plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "9" * 40,
+            "title": "稍后处理样例",
+        })
+        candidate_id = imported.data["candidate"]["candidate_id"]
+        ignored = self.plugin.api_ignore_candidate({"candidate_id": candidate_id, "ignored": True})
+        self.assertTrue(ignored.success)
+        self.assertEqual(ignored.data["candidate"]["status"], "ignored")
+        restored = self.plugin.api_ignore_candidate({"candidate_id": candidate_id, "ignored": "false"})
+        self.assertTrue(restored.success)
+        self.assertEqual(restored.data["candidate"]["status"], "discovered")
+
+    def test_unassigned_candidate_identity_can_be_corrected(self) -> None:
+        imported = self.plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "title": "待修正标题",
+        })
+        candidate_id = imported.data["candidate"]["candidate_id"]
+        updated = self.plugin.api_update_candidate({
+            "candidate_id": candidate_id,
+            "title": "  正确 标题  ",
+            "media_type": "movie",
+        })
+        self.assertTrue(updated.success)
+        self.assertEqual(updated.data["candidate"]["candidate_id"], candidate_id)
+        self.assertEqual(updated.data["candidate"]["title"], "正确 标题")
+        self.assertEqual(updated.data["candidate"]["media_type"], "movie")
+        self.assertTrue(updated.data["candidate"]["title_overridden"])
+        self.assertTrue(updated.data["candidate"]["media_type_overridden"])
+        self.assertFalse(self.plugin.api_update_candidate({
+            "candidate_id": candidate_id,
+            "media_type": "invalid",
+        }).success)
+
+    def test_retry_resubmits_failed_download_when_reference_is_available(self) -> None:
+        imported = self.plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "e" * 40,
+            "title": "重试下载样例",
+        })
+        candidate_id = imported.data["candidate"]["candidate_id"]
+        calls = []
+
+        def submit(*_: Any) -> str:
+            calls.append(True)
+            if len(calls) == 1:
+                raise self.module.PigGoCoreError("下载器暂时不可用")
+            return "e" * 40
+
+        self.plugin._submit_download_to_host = submit
+        failed = self.plugin.api_download_candidate({"candidate_id": candidate_id})
+        self.assertFalse(failed.success)
+        self.assertEqual(failed.data["task"]["state"], "RETRYABLE_FAILED")
+        retried = self.plugin.api_retry_task({"task_id": failed.data["task"]["task_id"]})
+        self.assertTrue(retried.success)
+        self.assertEqual(retried.data["task"]["state"], "DOWNLOADING")
+        self.assertEqual(len(calls), 2)
 
     def test_transfer_failed_scans_payload_and_completion_is_idempotent(self) -> None:
         imported = self.plugin.api_import_candidate({

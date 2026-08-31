@@ -62,7 +62,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -153,6 +153,14 @@ class PigGoKidsMetadata(_PluginBase):
                 "response_model": response_model,
             },
             {
+                "path": "/feeds",
+                "endpoint": self.api_feeds,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "读取脱敏 RSS 抓取状态",
+                "response_model": response_model,
+            },
+            {
                 "path": "/contribution-drafts",
                 "endpoint": self.api_contribution_drafts,
                 "methods": ["GET"],
@@ -193,6 +201,22 @@ class PigGoKidsMetadata(_PluginBase):
                 "response_model": response_model,
             },
             {
+                "path": "/candidates/ignore",
+                "endpoint": self.api_ignore_candidate,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "忽略或恢复尚未建立任务的候选",
+                "response_model": response_model,
+            },
+            {
+                "path": "/candidates/update",
+                "endpoint": self.api_update_candidate,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "修正尚未建立任务的候选标题和类型",
+                "response_model": response_model,
+            },
+            {
                 "path": "/candidates/download",
                 "endpoint": self.api_download_candidate,
                 "methods": ["POST"],
@@ -222,6 +246,14 @@ class PigGoKidsMetadata(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "重试扫描或整理任务",
+                "response_model": response_model,
+            },
+            {
+                "path": "/tasks/review",
+                "endpoint": self.api_review_task,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "批准或忽略待人工审核任务",
                 "response_model": response_model,
             },
             {
@@ -1442,6 +1474,29 @@ class PigGoKidsMetadata(_PluginBase):
             "decisions": list(self._load_decisions().values()),
         })
 
+    def api_feeds(self) -> schemas.Response[dict[str, Any]]:
+        """返回不含查询参数和私密 RSS 引用的抓取状态。"""
+
+        from .core import redact_url
+
+        items = []
+        for status in self._load_feed_status().values():
+            if not isinstance(status, dict):
+                continue
+            parts = urlsplit(redact_url(str(status.get("url") or "")))
+            label = f"{parts.scheme}://{parts.netloc}{parts.path}" if parts.hostname else ""
+            items.append({
+                "feed_id": str(status.get("feed_id") or ""),
+                "source": label[:1_000],
+                "last_attempt_at": status.get("last_attempt_at"),
+                "last_success_at": status.get("last_success_at"),
+                "http_status": status.get("http_status"),
+                "parsed_count": status.get("parsed_count") or 0,
+                "error_code": status.get("error_code"),
+            })
+        items.sort(key=lambda item: str(item.get("last_attempt_at") or ""), reverse=True)
+        return schemas.Response(success=True, data={"items": items, "total": len(items)})
+
     def _contribution_drafts(self) -> list[dict[str, Any]]:
         tasks = {str(item.get("task_id") or ""): item for item in self._load_tasks()}
         drafts = []
@@ -1523,6 +1578,83 @@ class PigGoKidsMetadata(_PluginBase):
         except (InvalidReferenceError, ValueError) as error:
             return schemas.Response(success=False, message=str(error), data={})
 
+    def api_ignore_candidate(self, payload: dict[str, Any]) -> schemas.Response[dict[str, Any]]:
+        """忽略或恢复尚未进入下载任务流的候选。"""
+
+        values = dict(payload or {})
+        candidate_id = str(values.get("candidate_id") or "").strip()
+        raw_ignored = values.get("ignored", True)
+        ignored = (
+            raw_ignored
+            if isinstance(raw_ignored, bool)
+            else str(raw_ignored).strip().casefold() not in {"false", "0", "no", "off"}
+        )
+        with self._state_lock:
+            candidates = self._load_candidates()
+            candidate = next(
+                (item for item in candidates if item.candidate_id == candidate_id),
+                None,
+            )
+            if not candidate:
+                return schemas.Response(success=False, message="候选资源不存在", data={})
+            if candidate.task_id:
+                return schemas.Response(success=False, message="候选已关联任务，请在任务页处理", data={})
+            expected = CandidateStatus.DISCOVERED if ignored else CandidateStatus.IGNORED
+            if candidate.status != expected:
+                return schemas.Response(
+                    success=False,
+                    message="当前候选状态不能执行此动作",
+                    data={"candidate": candidate.to_dict()},
+                )
+            candidate.status = CandidateStatus.IGNORED if ignored else CandidateStatus.DISCOVERED
+            candidate.updated_at = utc_now()
+            self._save_candidates(candidates)
+            return schemas.Response(success=True, data={"candidate": candidate.to_dict()})
+
+    def api_update_candidate(self, payload: dict[str, Any]) -> schemas.Response[dict[str, Any]]:
+        """修正未进入任务流的候选显示标题和媒体类型，稳定 ID 保持不变。"""
+
+        values = dict(payload or {})
+        candidate_id = str(values.get("candidate_id") or "").strip()
+        if "title" not in values and "media_type" not in values:
+            return schemas.Response(success=False, message="至少提供标题或媒体类型", data={})
+        title = " ".join(str(values.get("title") or "").replace("\x00", " ").split())
+        try:
+            media_type = (
+                MediaKind(str(values.get("media_type") or "").casefold())
+                if "media_type" in values
+                else None
+            )
+        except ValueError:
+            return schemas.Response(success=False, message="媒体类型无效", data={})
+        if "title" in values and not title:
+            return schemas.Response(success=False, message="候选标题不能为空", data={})
+        with self._state_lock:
+            candidates = self._load_candidates()
+            candidate = next(
+                (item for item in candidates if item.candidate_id == candidate_id),
+                None,
+            )
+            if not candidate:
+                return schemas.Response(success=False, message="候选资源不存在", data={})
+            if candidate.task_id:
+                return schemas.Response(
+                    success=False,
+                    message="候选已关联任务，请在任务页处理",
+                    data={},
+                )
+            if candidate.status not in {CandidateStatus.DISCOVERED, CandidateStatus.IGNORED}:
+                return schemas.Response(success=False, message="当前候选状态不能修改", data={})
+            if "title" in values:
+                candidate.title = title[:500]
+                candidate.title_overridden = True
+            if media_type is not None:
+                candidate.media_type = media_type
+                candidate.media_type_overridden = True
+            candidate.updated_at = utc_now()
+            self._save_candidates(candidates)
+            return schemas.Response(success=True, data={"candidate": candidate.to_dict()})
+
     def api_download_candidate(self, payload: dict[str, Any]) -> schemas.Response[dict[str, Any]]:
         """显式选择候选并通过 MoviePilot 已配置下载器提交。"""
 
@@ -1594,11 +1726,72 @@ class PigGoKidsMetadata(_PluginBase):
             if success and task.state == TaskState.READY_TO_TRANSFER and decision:
                 success, message = self._start_host_transfer(task, decision)
             return schemas.Response(success=success, message=message, data={"task": task.to_dict()})
+        if task.state == TaskState.RETRYABLE_FAILED and task.candidate_id:
+            return self.api_download_candidate({"candidate_id": task.candidate_id})
         return schemas.Response(
             success=False,
             message="当前任务状态没有可执行的重试动作",
             data={"task": task.to_dict()},
         )
+
+    def api_review_task(self, payload: dict[str, Any]) -> schemas.Response[dict[str, Any]]:
+        """人工处理冲突任务；批准后仍需显式执行整理。"""
+
+        values = dict(payload or {})
+        task_id = str(values.get("task_id") or "").strip()
+        action = str(values.get("action") or "").strip().casefold()
+        if action not in {"approve", "ignore"}:
+            return schemas.Response(
+                success=False,
+                message="审核动作必须是 approve 或 ignore",
+                data={},
+            )
+        with self._state_lock:
+            task = self._find_task(task_id)
+            if not task:
+                return schemas.Response(success=False, message="任务不存在", data={})
+            if task.state != TaskState.NEEDS_REVIEW:
+                return schemas.Response(
+                    success=False,
+                    message="只有待人工审核任务可以执行此动作",
+                    data={"task": task.to_dict()},
+                )
+            decision = self._load_decisions().get(task.task_id)
+            if not decision or not isinstance(decision.get("item"), dict):
+                return schemas.Response(
+                    success=False,
+                    message="任务缺少可审核的识别决策",
+                    data={"task": task.to_dict()},
+                )
+            decision["review"] = {"action": action, "reviewed_at": utc_now()}
+            if action == "approve":
+                decision["auto_eligible"] = True
+                task.transition(TaskState.READY_TO_TRANSFER, "user_review_approved")
+                item = decision["item"]
+                if item.get("media_source") == "piggokids":
+                    self._save_registry_item(item)
+                self._update_candidate(
+                    task.candidate_id,
+                    status=CandidateStatus.SELECTED,
+                    task_id=task.task_id,
+                )
+                message = "审核已批准，请确认后执行整理"
+            else:
+                decision["auto_eligible"] = False
+                task.transition(TaskState.IGNORED, "user_review_ignored")
+                self._update_candidate(
+                    task.candidate_id,
+                    status=CandidateStatus.IGNORED,
+                    task_id=task.task_id,
+                )
+                message = "任务已忽略"
+            self._save_decision(task.task_id, decision)
+            self._save_task(task)
+            return schemas.Response(
+                success=True,
+                message=message,
+                data={"task": task.to_dict(), "decision": decision},
+            )
 
     def api_retry_task_action(self, task_id: str = "") -> schemas.Response[dict[str, Any]]:
         """为 Vuetify 详情页提供不需要构造 JSON 请求体的重试动作。"""
