@@ -27,9 +27,10 @@ export default defineConfig({
   ],
   build: {
     target: "esnext",
-    minify: false,
+    minify: true,
     cssCodeSplit: true,
     emptyOutDir: true,
     outDir: "../../plugins.v2/piggokidsmetadata/dist/assets",
+    assetsDir: "",
   },
 });

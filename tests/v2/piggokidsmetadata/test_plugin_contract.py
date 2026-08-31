@@ -133,8 +133,9 @@ class V2PluginContractTest(unittest.TestCase):
                 "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/review",
                 "/tasks/retry-action",
             })
-            self.assertEqual(plugin.get_render_mode(), ("vuetify", ""))
-            self.assertEqual(plugin.get_sidebar_nav(), [])
+            with mock.patch.object(self.module.Path, "is_file", return_value=False):
+                self.assertEqual(plugin.get_render_mode(), ("vuetify", ""))
+                self.assertEqual(plugin.get_sidebar_nav(), [])
             with mock.patch.object(self.module.Path, "is_file", return_value=True):
                 self.assertEqual(plugin.get_render_mode(), ("vue", "dist/assets"))
                 self.assertEqual(plugin.get_sidebar_nav()[0]["nav_key"], "main")
