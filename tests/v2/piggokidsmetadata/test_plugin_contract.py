@@ -383,6 +383,65 @@ class V2PluginContractTest(unittest.TestCase):
             plugin.on_transfer_complete(completed_event)
             self.assertEqual(plugin.api_tasks()["data"]["items"][0]["state"], "COMPLETED")
 
+    def test_confirmed_transfer_is_submitted_as_manual_to_clear_failed_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "Show"
+            payload.mkdir()
+            calls = []
+
+            class FakeMediaInfo:
+                def __init__(self, **values: Any) -> None:
+                    self.__dict__.update(values)
+
+            class FakeTransferChain:
+                def do_transfer(self, **kwargs: Any) -> tuple[bool, str]:
+                    calls.append(kwargs)
+                    return True, ""
+
+            chain = types.ModuleType("app.chain")
+            chain_transfer = types.ModuleType("app.chain.transfer")
+            chain_transfer.TransferChain = FakeTransferChain
+            core_context = types.ModuleType("app.core.context")
+            core_context.MediaInfo = FakeMediaInfo
+            module_names = ["app.chain", "app.chain.transfer", "app.core.context"]
+            previous = {name: sys.modules.get(name) for name in module_names}
+            sys.modules.update({
+                "app.chain": chain,
+                "app.chain.transfer": chain_transfer,
+                "app.core.context": core_context,
+            })
+            try:
+                plugin = self.module.PigGoKidsMetadata()
+                plugin.init_plugin({"enabled": True, "scan_root": str(root)})
+                task = types.SimpleNamespace(
+                    relative_source_path="Show",
+                    media_id="piggo:tv:item:1",
+                    downloader="QB",
+                    download_hash="1" * 40,
+                )
+                success, _ = plugin._submit_transfer_to_host(task, {
+                    "item": {
+                        "media_type": "tv",
+                        "media_source": "piggokids",
+                        "media_id": "piggo:tv:item:1",
+                        "title": "测试动画",
+                        "season": 1,
+                    }
+                })
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = value
+
+            self.assertTrue(success)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0]["manual"])
+            self.assertTrue(calls[0]["background"])
+            self.assertEqual(calls[0]["mediainfo"].source, "piggokids")
+
     def test_synchronous_download_event_is_not_overwritten(self) -> None:
         plugin = self.module.PigGoKidsMetadata()
         plugin.init_plugin({"enabled": True})

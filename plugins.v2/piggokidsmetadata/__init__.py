@@ -61,7 +61,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.4.2"
+    plugin_version = "0.4.3"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -1092,6 +1092,10 @@ class PigGoKidsMetadata(_PluginBase):
             season=item.get("season"),
             scrape=False,
             background=True,
+            # 用户确认后的提交属于手工整理。MoviePilot 会据此清理同一
+            # 源文件之前失败的整理历史，避免旧的“未识别到媒体信息”
+            # 记录让整批文件被误判为“已整理过”。
+            manual=True,
             downloader=task.downloader,
             download_hash=task.download_hash,
             sync_extra_files=True,
