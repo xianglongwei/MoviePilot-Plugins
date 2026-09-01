@@ -228,6 +228,15 @@
                       <VProgressCircular indeterminate color="primary" size="24" />
                     </div>
                   </template>
+                  <template #error>
+                    <div
+                      class="candidate-poster-fallback"
+                      :title="candidate.title"
+                    >
+                      <span class="candidate-poster-fallback-label">PigGo</span>
+                      <span>{{ posterFallbackTitle(candidate.title) }}</span>
+                    </div>
+                  </template>
                 </VImg>
                 <div class="candidate-heading">
                   <VCardTitle class="candidate-title">{{
@@ -644,7 +653,12 @@
 <script setup>
 import { computed, inject, onMounted, reactive, ref, watch } from "vue";
 import { createPluginApi, messageOf } from "./api";
-import { filterCandidates, filterTasks, maskHash } from "./workflow";
+import {
+  filterCandidates,
+  filterTasks,
+  maskHash,
+  posterFallbackTitle,
+} from "./workflow";
 
 const props = defineProps({
   api: { type: Object, required: true },
@@ -1104,6 +1118,33 @@ onMounted(loadAll);
   display: flex;
   align-items: center;
   justify-content: center;
+}
+.candidate-poster-fallback {
+  width: 100%;
+  height: 100%;
+  padding: 10px 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: rgb(var(--v-theme-on-primary-container));
+  background:
+    radial-gradient(circle at 75% 20%, rgba(var(--v-theme-primary), 0.34), transparent 40%),
+    linear-gradient(150deg, rgb(var(--v-theme-surface-variant)), rgb(var(--v-theme-primary-container)));
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+.candidate-poster-fallback-label {
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  opacity: 0.82;
 }
 .candidate-summary {
   display: -webkit-box;

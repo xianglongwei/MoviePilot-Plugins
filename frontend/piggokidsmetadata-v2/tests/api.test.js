@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createPluginApi, messageOf } from "../src/api.js";
-import { filterCandidates, filterTasks, maskHash } from "../src/workflow.js";
+import {
+  filterCandidates,
+  filterTasks,
+  maskHash,
+  posterFallbackTitle,
+} from "../src/workflow.js";
 
 test("unwraps MoviePilot response envelopes", async () => {
   const calls = [];
@@ -88,4 +93,9 @@ test("filters candidates and tasks without exposing full hashes", () => {
     maskHash("0123456789abcdef0123456789abcdef01234567"),
     "01234567…4567",
   );
+  assert.equal(
+    posterFallbackTitle("海底小纵队 S11 Complete 2026 2160P WEB-DL"),
+    "海底小纵队",
+  );
+  assert.equal(posterFallbackTitle(""), "候选资源");
 });

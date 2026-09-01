@@ -61,3 +61,15 @@ export function maskHash(value) {
   if (text.length <= 12) return text;
   return `${text.slice(0, 8)}…${text.slice(-4)}`;
 }
+
+export function posterFallbackTitle(value) {
+  const title = String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!title) return "候选资源";
+  const concise = title.split(
+    /\s+(?=S\d{1,2}\b|(?:19|20)\d{2}\b|Complete\b|2160[Pp]\b|1080[Pp]\b)/,
+    1,
+  )[0];
+  return (concise || title).slice(0, 24);
+}
