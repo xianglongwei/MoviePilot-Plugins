@@ -262,6 +262,61 @@ class V2PluginContractTest(unittest.TestCase):
                 "piggokids,MOVIEPILOT",
             )
 
+    def test_download_name_replaces_download_php_in_candidate_and_history(self) -> None:
+        class FakeHistory:
+            title = "download.php"
+            torrent_name = "download.php"
+
+            def update(self, _: Any, payload: dict[str, Any]) -> None:
+                self.__dict__.update(payload)
+
+        history = FakeHistory()
+
+        class FakeDownloadHistoryOper:
+            _db = None
+
+            @staticmethod
+            def get_by_hash(_: str) -> Any:
+                return history
+
+        download_oper = types.ModuleType("app.db.downloadhistory_oper")
+        download_oper.DownloadHistoryOper = FakeDownloadHistoryOper
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        imported = plugin.api_import_candidate({
+            "download_reference": "https://piggo.example/download.php?passkey=secret",
+        })
+        candidate_id = imported["data"]["candidate"]["candidate_id"]
+        task = self.module.ImportTask(
+            task_id="real-name",
+            candidate_id=candidate_id,
+            download_hash="4" * 40,
+        )
+        with mock.patch.dict(sys.modules, {"app.db.downloadhistory_oper": download_oper}):
+            adopted = plugin._adopt_download_name(
+                task,
+                "百科探秘AI少年.S01.2026.2160P.WEB-DL-PigoWeb",
+            )
+        self.assertEqual(adopted, "百科探秘AI少年.S01.2026.2160P.WEB-DL-PigoWeb")
+        self.assertEqual(
+            plugin.api_candidates()["data"]["items"][0]["title"],
+            "百科探秘AI少年.S01.2026.2160P.WEB-DL-PigoWeb",
+        )
+        self.assertEqual(history.title, adopted)
+        self.assertEqual(history.torrent_name, adopted)
+
+    def test_explicit_manual_title_is_not_replaced_by_torrent_name(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        imported = plugin.api_import_candidate({
+            "download_reference": "https://piggo.example/download.php?passkey=secret",
+            "title": "我的标题",
+        })
+        candidate_id = imported["data"]["candidate"]["candidate_id"]
+        task = self.module.ImportTask(task_id="manual-title", candidate_id=candidate_id)
+        plugin._adopt_download_name(task, "Torrent.Real.Name")
+        self.assertEqual(plugin.api_candidates()["data"]["items"][0]["title"], "我的标题")
+
     def test_plugin_download_is_reserved_from_host_auto_transfer(self) -> None:
         calls = []
 

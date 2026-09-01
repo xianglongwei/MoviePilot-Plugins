@@ -66,7 +66,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.2"
+    plugin_version = "0.7.3"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -593,6 +593,82 @@ class PigGoKidsMetadata(_PluginBase):
                         item.task_id = task_id
                     self._save_candidates(candidates)
                     return
+
+    @staticmethod
+    def _is_placeholder_download_title(value: Any) -> bool:
+        """判断标题是否只是下载接口文件名，而非真实资源名。"""
+
+        title = str(value or "").strip().casefold()
+        return title in {"download", "download.php", "download.torrent", "手工粘贴资源"}
+
+    def _adopt_download_name(self, task: ImportTask, value: Any) -> Optional[str]:
+        """用下载器解析出的种子名纠正候选和 MP 历史中的占位标题。"""
+
+        name = Path(str(value or "").strip()).name.strip()[:500]
+        if not name or self._is_placeholder_download_title(name):
+            return None
+        if name.casefold().endswith(".torrent"):
+            name = name[:-8].strip()
+        if not name:
+            return None
+        with self._state_lock:
+            candidates = self._load_candidates()
+            for candidate in candidates:
+                if (
+                    candidate.candidate_id == task.candidate_id
+                    and not candidate.title_overridden
+                    and self._is_placeholder_download_title(candidate.title)
+                ):
+                    candidate.title = name
+                    candidate.updated_at = utc_now()
+                    self._save_candidates(candidates)
+                    break
+        if not task.download_hash:
+            return name
+        try:
+            from app.db.downloadhistory_oper import DownloadHistoryOper
+
+            oper = DownloadHistoryOper()
+            history = oper.get_by_hash(task.download_hash)
+            if history:
+                payload = {}
+                if self._is_placeholder_download_title(getattr(history, "title", None)):
+                    payload["title"] = name
+                if self._is_placeholder_download_title(getattr(history, "torrent_name", None)):
+                    payload["torrent_name"] = name
+                if payload:
+                    history.update(oper._db, payload)
+        except Exception:
+            logger.error("PigGoKidsMetadata V2 下载标题回填失败：unexpected_error")
+        return name
+
+    def _recover_download_name_from_host(self, task: ImportTask) -> Optional[str]:
+        """按 hash 从本地下载器读取真实种子名，不访问资源站点。"""
+
+        if not task.download_hash:
+            return None
+        try:
+            from app.chain.download import DownloadChain
+
+            chain = DownloadChain()
+            try:
+                torrents = chain.list_torrents(
+                    downloader=task.downloader or self._downloader or None,
+                    hashs=[task.download_hash],
+                    include_all_tags=True,
+                ) or []
+            except TypeError:
+                torrents = chain.list_torrents(
+                    downloader=task.downloader or self._downloader or None,
+                    hashs=[task.download_hash],
+                ) or []
+            for torrent in torrents:
+                values = self._record_values(torrent)
+                if normalize_download_hash(values.get("hash")) == normalize_download_hash(task.download_hash):
+                    return self._adopt_download_name(task, values.get("name"))
+        except Exception:
+            logger.error("PigGoKidsMetadata V2 下载名称恢复失败：unexpected_error")
+        return None
 
     def _save_decision(self, task_id: str, decision: dict[str, Any]) -> None:
         with self._state_lock:
@@ -1538,6 +1614,7 @@ class PigGoKidsMetadata(_PluginBase):
             task.transition(TaskState.DOWNLOADING, "download_added_event")
         self._save_task(task)
         self._reserve_download_for_plugin(task)
+        self._recover_download_name_from_host(task)
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
@@ -1766,6 +1843,8 @@ class PigGoKidsMetadata(_PluginBase):
         transfer_failed = 0
         transfer_pending = 0
         for task in tasks:
+            if task.relative_source_path:
+                self._adopt_download_name(task, Path(task.relative_source_path).name)
             if task.state in {TaskState.TRANSFERRING, TaskState.LIBRARY_REFRESHING}:
                 outcome = self._reconcile_transfer_history(task)
                 transfer_completed += int(outcome == "completed")
@@ -1793,6 +1872,7 @@ class PigGoKidsMetadata(_PluginBase):
                     history.get("downloader") or task.downloader or ""
                 ) or None
                 task.relative_source_path = relative
+                self._adopt_download_name(task, Path(relative).name)
                 self._save_task(task)
                 success, _, _ = self._scan_task(
                     task,
@@ -1802,12 +1882,14 @@ class PigGoKidsMetadata(_PluginBase):
                 continue
             tracked += 1
             task.downloader = str(torrent.get("downloader") or task.downloader or "") or None
+            self._adopt_download_name(task, torrent.get("name"))
             if not self._torrent_completed(torrent):
                 self._save_task(task)
                 continue
             relative = self._relative_source_from_host_path(torrent.get("path"))
             if relative:
                 task.relative_source_path = relative
+                self._adopt_download_name(task, Path(relative).name)
             self._save_task(task)
             if task.relative_source_path:
                 success, _, _ = self._scan_task(task, reason="download_poll_completed")

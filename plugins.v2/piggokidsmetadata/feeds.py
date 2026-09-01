@@ -492,6 +492,7 @@ def candidate_from_reference(
             site_item_id=site_item_id,
             media_type=media_type,
             download_url=redact_url(download),
+            title_overridden=bool(str(title or "").strip()),
         ),
         download_reference=download,
     )
