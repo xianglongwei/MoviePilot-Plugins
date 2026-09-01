@@ -159,6 +159,27 @@ class V2PluginContractTest(unittest.TestCase):
         self.assertEqual(response["data"]["items"][0]["source"], "https://piggo.example/rss.php")
         self.assertNotIn("never-expose-this", json.dumps(response, ensure_ascii=False))
 
+    def test_rss_artwork_is_transient_and_rejects_unsafe_sources(self) -> None:
+        feeds = sys.modules[f"{self.module.__name__}.feeds"]
+        xml = """<rss><channel><item>
+          <title>Kids Show S01</title>
+          <link>https://piggo.example/details.php?id=321</link>
+          <enclosure url="https://piggo.example/download.php?id=321" />
+          <description><![CDATA[
+            <img src="https://images.example.test/poster.webp?token=abcdefghijklmnopqrstuvwxyz123456" />
+            <img src="http://127.0.0.1/private.jpg" />
+            <img src="javascript:alert(1)" />
+          ]]></description>
+        </item></channel></rss>"""
+        item = feeds.parse_feed_document(xml, source_feed_id="feed:artwork")[0]
+        self.assertEqual(item.artwork_references, (
+            "https://images.example.test/poster.webp?token=abcdefghijklmnopqrstuvwxyz123456",
+        ))
+        self.assertNotIn(
+            "abcdefghijklmnopqrstuvwxyz123456",
+            str(item.candidate.to_dict()),
+        )
+
     def test_conflict_review_requires_explicit_transfer_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -65,24 +65,6 @@ class FeedParsingTest(unittest.TestCase):
         self.assertNotIn("very-secret", str(item.candidate.to_dict()))
         self.assertIn("very-secret", item.download_reference)
 
-    def test_rss_artwork_is_transient_and_rejects_unsafe_sources(self):
-        xml = """<rss><channel><item>
-          <title>Kids Show S01</title>
-          <link>https://piggo.example/details.php?id=321</link>
-          <enclosure url="https://piggo.example/download.php?id=321" />
-          <description><![CDATA[
-            <img src="https://images.example.test/poster.webp?token=abcdefghijklmnopqrstuvwxyz123456" />
-            <img src="http://127.0.0.1/private.jpg" />
-            <img src="javascript:alert(1)" />
-          ]]></description>
-        </item></channel></rss>"""
-        item = feeds.parse_feed_document(xml, source_feed_id="feed:artwork")[0]
-        self.assertEqual(item.artwork_references, (
-            "https://images.example.test/poster.webp?token=abcdefghijklmnopqrstuvwxyz123456",
-        ))
-        persisted = str(item.candidate.to_dict())
-        self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", persisted)
-
     def test_atom_enclosure_is_supported(self):
         xml = """<feed xmlns="http://www.w3.org/2005/Atom">
           <entry><title>儿童电影 Movie</title><id>tag:example,2025:abc</id>
