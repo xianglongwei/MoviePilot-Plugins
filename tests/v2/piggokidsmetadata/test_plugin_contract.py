@@ -129,7 +129,7 @@ class V2PluginContractTest(unittest.TestCase):
             self.assertEqual({item["path"] for item in plugin.get_api()}, {
                 "/status", "/registry", "/feeds", "/contribution-drafts", "/scan", "/candidates",
                 "/candidates/refresh", "/candidates/import", "/candidates/ignore", "/candidates/update",
-                "/candidates/download",
+                "/candidates/download", "/downloads/manual",
                 "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/review",
                 "/tasks/artwork", "/tasks/reconcile", "/tasks/retry-action",
             })
@@ -316,6 +316,25 @@ class V2PluginContractTest(unittest.TestCase):
         task = self.module.ImportTask(task_id="manual-title", candidate_id=candidate_id)
         plugin._adopt_download_name(task, "Torrent.Real.Name")
         self.assertEqual(plugin.api_candidates()["data"]["items"][0]["title"], "我的标题")
+
+    def test_manual_download_is_one_public_action(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        submitted = self.module.ImportTask(task_id="manual-direct")
+        with mock.patch.object(
+            plugin,
+            "_submit_candidate_download",
+            return_value=(True, submitted, "下载任务已提交"),
+        ) as download:
+            response = plugin.api_manual_download({
+                "download_reference": "magnet:?xt=urn:btih:" + "3" * 40,
+                "title": "一步下载",
+                "media_type": "tv",
+            })
+        self.assertTrue(response["success"])
+        self.assertEqual(response["data"]["task"]["task_id"], "manual-direct")
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual(plugin.api_candidates()["data"]["total"], 1)
 
     def test_plugin_download_is_reserved_from_host_auto_transfer(self) -> None:
         calls = []

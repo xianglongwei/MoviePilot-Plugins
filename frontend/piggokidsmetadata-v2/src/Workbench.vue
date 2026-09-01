@@ -64,7 +64,7 @@
     <VWindow v-model="tab" class="mt-4">
       <VWindowItem value="candidates">
         <VCard variant="outlined" class="mb-4">
-          <VCardTitle class="text-subtitle-1">粘贴下载链接</VCardTitle>
+          <VCardTitle class="text-subtitle-1">手工下载</VCardTitle>
           <VCardText>
             <VRow>
               <VCol cols="12" md="6">
@@ -118,20 +118,12 @@
                 刷新 RSS
               </VBtn>
               <VBtn
-                :disabled="!canImport"
-                :loading="actionLoading === 'import'"
-                variant="outlined"
-                @click="importReference(false)"
-              >
-                仅加入候选
-              </VBtn>
-              <VBtn
-                :disabled="!canImport"
-                :loading="actionLoading === 'import-download'"
+                :disabled="!canDownloadManual"
+                :loading="actionLoading === 'manual-download'"
                 color="primary"
-                @click="importReference(true)"
+                @click="downloadManual"
               >
-                导入并下载
+                立即下载
               </VBtn>
             </div>
           </VCardText>
@@ -730,7 +722,7 @@ const taskFilters = [
   { title: "已忽略", value: "ignored" },
 ];
 
-const canImport = computed(
+const canDownloadManual = computed(
   () => status.value.enabled && importForm.download_reference.trim().length > 0,
 );
 const metrics = computed(() => [
@@ -829,25 +821,18 @@ async function refreshRss() {
   );
 }
 
-async function importReference(downloadNow) {
-  const key = downloadNow ? "import-download" : "import";
+async function downloadManual() {
   await runAction(
-    key,
+    "manual-download",
     async () => {
-      const imported = await client.post("/candidates/import", {
+      await client.post("/downloads/manual", {
         ...importForm,
       });
-      if (downloadNow) {
-        await client.post("/candidates/download", {
-          candidate_id: imported.candidate.candidate_id,
-          media_type: importForm.media_type,
-        });
-      }
       importForm.download_reference = "";
       importForm.title = "";
       importForm.poster_url = "";
     },
-    downloadNow ? "已提交到 MoviePilot 下载器" : "已加入候选列表",
+    "已提交到 MoviePilot 下载器",
   );
 }
 

@@ -66,7 +66,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.4"
+    plugin_version = "0.7.5"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -206,6 +206,13 @@ class PigGoKidsMetadata(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "导入用户粘贴的下载引用",
+            },
+            {
+                "path": "/downloads/manual",
+                "endpoint": self.api_manual_download,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "直接下载用户粘贴的引用",
             },
             {
                 "path": "/candidates/ignore",
@@ -2214,6 +2221,21 @@ class PigGoKidsMetadata(_PluginBase):
             )
         success, task, message = self._submit_candidate_download(candidate, reference)
         return self._response(success, {"task": task.to_dict()}, message)
+
+    def api_manual_download(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """一步提交手工链接；候选记录仅作为插件内部任务跟踪数据。"""
+
+        imported = self.api_import_candidate(payload)
+        if not imported.get("success"):
+            return imported
+        candidate = dict(imported.get("data") or {}).get("candidate") or {}
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if not candidate_id:
+            return self._response(False, message="手工下载任务初始化失败")
+        return self.api_download_candidate({
+            "candidate_id": candidate_id,
+            "media_type": dict(payload or {}).get("media_type"),
+        })
 
     def api_download_candidate_action(self, candidate_id: str = "") -> dict[str, Any]:
         return self.api_download_candidate({"candidate_id": candidate_id})
