@@ -68,7 +68,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.6"
+    plugin_version = "0.7.7"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -966,10 +966,21 @@ class PigGoKidsMetadata(_PluginBase):
 
         self._restore_candidate_artwork_references(candidate_id)
         for reference in self._candidate_artwork_references.get(str(candidate_id or ""), ()):
+            try:
+                plugin_parts = urlsplit(reference)
+            except ValueError:
+                plugin_parts = None
             if (
-                reference.startswith(
+                plugin_parts
+                and plugin_parts.path.startswith(
                     "/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/"
                 )
+                and plugin_parts.scheme.casefold() in {"", "http", "https"}
+                and (not plugin_parts.scheme or plugin_parts.hostname)
+                and not plugin_parts.username
+                and not plugin_parts.password
+                and not plugin_parts.query
+                and not plugin_parts.fragment
                 and ".." not in reference
             ):
                 return reference
@@ -1049,9 +1060,32 @@ class PigGoKidsMetadata(_PluginBase):
                     pass
 
     @classmethod
-    def _task_artwork_public_url(cls, task: ImportTask, extension: str) -> str:
+    def _task_artwork_public_url(
+        cls,
+        task: ImportTask,
+        extension: str,
+        public_base_url: str = "",
+    ) -> str:
         name = cls._task_artwork_cache_name(task, extension)
-        return f"/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/{name}"
+        path = f"/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/{name}"
+        base = str(public_base_url or "").strip().rstrip("/")
+        if not base:
+            return path
+        try:
+            parts = urlsplit(base)
+        except ValueError as error:
+            raise PigGoCoreError("MoviePilot API 地址格式无效") from error
+        if (
+            parts.scheme.casefold() not in {"http", "https"}
+            or not parts.hostname
+            or parts.username
+            or parts.password
+            or parts.query
+            or parts.fragment
+            or parts.path not in {"", "/"}
+        ):
+            raise PigGoCoreError("MoviePilot API 地址必须是 HTTP(S) 站点根地址")
+        return f"{base}{path}"
 
     def _set_candidate_uploaded_artwork(self, task: ImportTask, artwork_url: str) -> None:
         if not task.candidate_id:
@@ -1088,7 +1122,16 @@ class PigGoKidsMetadata(_PluginBase):
                 if len(content) > MAX_ARTWORK_BYTES:
                     continue
                 cache = self._cache_task_artwork(task, content, extension)
-                artwork_url = self._task_artwork_public_url(task, cache.suffix)
+                candidate = next(
+                    (
+                        item for item in self._load_candidates()
+                        if item.candidate_id == task.candidate_id
+                    ),
+                    None,
+                )
+                existing_url = str(getattr(candidate, "poster_url", "") or "")
+                expected_path = self._task_artwork_public_url(task, cache.suffix)
+                artwork_url = existing_url if existing_url.endswith(expected_path) else expected_path
                 self._set_candidate_uploaded_artwork(task, artwork_url)
                 self._backfill_host_history_artwork(task, artwork_url)
                 restored += 1
@@ -1143,7 +1186,12 @@ class PigGoKidsMetadata(_PluginBase):
             return False
 
     @staticmethod
-    def _backfill_host_history_artwork(task: ImportTask, artwork_url: Optional[str]) -> int:
+    def _backfill_host_history_artwork(
+        task: ImportTask,
+        artwork_url: Optional[str],
+        *,
+        replace_plugin_artwork: bool = False,
+    ) -> int:
         """为既有 MP 下载/整理历史补齐封面字段，不覆盖已有图片。"""
 
         if not task.download_hash or not artwork_url:
@@ -1157,16 +1205,25 @@ class PigGoKidsMetadata(_PluginBase):
             download_history = download_oper.get_by_hash(task.download_hash)
             if download_history:
                 payload = {}
-                if not getattr(download_history, "poster", None):
+                current_poster = str(getattr(download_history, "poster", None) or "")
+                current_image = str(getattr(download_history, "image", None) or "")
+                if not current_poster or (
+                    replace_plugin_artwork and "/user-artwork/" in current_poster
+                ):
                     payload["poster"] = artwork_url
-                if not getattr(download_history, "image", None):
+                if not current_image or (
+                    replace_plugin_artwork and "/user-artwork/" in current_image
+                ):
                     payload["image"] = artwork_url
                 if payload:
                     download_history.update(download_oper._db, payload)
                     updated += 1
             transfer_oper = TransferHistoryOper()
             for history in transfer_oper.list_by_hash(task.download_hash) or []:
-                if not getattr(history, "image", None):
+                current_image = str(getattr(history, "image", None) or "")
+                if not current_image or (
+                    replace_plugin_artwork and "/user-artwork/" in current_image
+                ):
                     history.update(transfer_oper._db, {"image": artwork_url})
                     updated += 1
             return updated
@@ -2207,9 +2264,17 @@ class PigGoKidsMetadata(_PluginBase):
             poster = self._write_artwork(target_dir, content, extension)
             cached_content = poster.read_bytes()
             cache = self._cache_task_artwork(task, cached_content, poster.suffix.casefold())
-            artwork_url = self._task_artwork_public_url(task, cache.suffix)
+            artwork_url = self._task_artwork_public_url(
+                task,
+                cache.suffix,
+                str(values.get("public_base_url") or ""),
+            )
             self._set_candidate_uploaded_artwork(task, artwork_url)
-            history_updated = self._backfill_host_history_artwork(task, artwork_url)
+            history_updated = self._backfill_host_history_artwork(
+                task,
+                artwork_url,
+                replace_plugin_artwork=True,
+            )
             return self._response(True, {
                 "task_id": task.task_id,
                 "poster_path": str(poster),

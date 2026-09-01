@@ -420,6 +420,21 @@ class V2PluginContractTest(unittest.TestCase):
         with self.assertRaises(self.module.PigGoCoreError):
             self.module.PigGoKidsMetadata._decode_uploaded_artwork(invalid)
 
+    def test_uploaded_artwork_url_can_target_moviepilot_api_origin(self) -> None:
+        task = self.module.ImportTask(task_id="absolute-artwork")
+        url = self.module.PigGoKidsMetadata._task_artwork_public_url(
+            task,
+            ".jpg",
+            "http://192.168.10.20:3001",
+        )
+        self.assertTrue(url.startswith("http://192.168.10.20:3001/api/v1/plugin/file/"))
+        with self.assertRaises(self.module.PigGoCoreError):
+            self.module.PigGoKidsMetadata._task_artwork_public_url(
+                task,
+                ".jpg",
+                "http://user:pass@192.168.10.20:3001",
+            )
+
     def test_transfer_history_reconciles_missed_success_events(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
