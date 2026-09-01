@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import json
 import sys
 import tempfile
@@ -131,7 +132,7 @@ class V2PluginContractTest(unittest.TestCase):
                 "/candidates/refresh", "/candidates/import", "/candidates/ignore", "/candidates/update",
                 "/candidates/download", "/downloads/manual",
                 "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/review",
-                "/tasks/artwork", "/tasks/reconcile", "/tasks/retry-action",
+                "/tasks/artwork", "/tasks/artwork-upload", "/tasks/reconcile", "/tasks/retry-action",
             })
             with mock.patch.object(self.module.Path, "is_file", return_value=False):
                 self.assertEqual(plugin.get_render_mode(), ("vuetify", ""))
@@ -407,6 +408,17 @@ class V2PluginContractTest(unittest.TestCase):
         self.assertEqual(download_history.image, "https://images.example.test/poster.jpg")
         self.assertEqual(transfer_histories[0].image, "https://images.example.test/poster.jpg")
         self.assertEqual(transfer_histories[1].image, "existing")
+
+    def test_uploaded_artwork_accepts_jpeg_and_rejects_non_image(self) -> None:
+        encoded = base64.b64encode(b"\xff\xd8\xff" + b"jpeg-data").decode("ascii")
+        content, extension = self.module.PigGoKidsMetadata._decode_uploaded_artwork(
+            f"data:image/jpeg;base64,{encoded}"
+        )
+        self.assertEqual(content, b"\xff\xd8\xffjpeg-data")
+        self.assertEqual(extension, ".jpg")
+        invalid = base64.b64encode(b"not-an-image").decode("ascii")
+        with self.assertRaises(self.module.PigGoCoreError):
+            self.module.PigGoKidsMetadata._decode_uploaded_artwork(invalid)
 
     def test_transfer_history_reconciles_missed_success_events(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

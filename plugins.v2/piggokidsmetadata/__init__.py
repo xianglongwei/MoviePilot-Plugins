@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import binascii
 import os
 import tempfile
 import threading
@@ -66,7 +68,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.5"
+    plugin_version = "0.7.6"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -118,6 +120,7 @@ class PigGoKidsMetadata(_PluginBase):
         except (TypeError, ValueError):
             self._max_files = 10_000
         self._repair_placeholder_download_titles()
+        self._restore_uploaded_artwork_cache()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -269,6 +272,13 @@ class PigGoKidsMetadata(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "从 RSS 为已整理任务补写本地封面",
+            },
+            {
+                "path": "/tasks/artwork-upload",
+                "endpoint": self.api_upload_task_artwork,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "上传图片并为已整理任务补写封面",
             },
             {
                 "path": "/tasks/reconcile",
@@ -956,6 +966,13 @@ class PigGoKidsMetadata(_PluginBase):
 
         self._restore_candidate_artwork_references(candidate_id)
         for reference in self._candidate_artwork_references.get(str(candidate_id or ""), ()):
+            if (
+                reference.startswith(
+                    "/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/"
+                )
+                and ".." not in reference
+            ):
+                return reference
             if "***" in reference:
                 continue
             try:
@@ -973,6 +990,111 @@ class PigGoKidsMetadata(_PluginBase):
             ):
                 return reference
         return None
+
+    @staticmethod
+    def _decode_uploaded_artwork(value: Any) -> tuple[bytes, str]:
+        """解码受限的 JPEG/PNG/WebP data URL 或纯 Base64。"""
+
+        encoded = str(value or "").strip()
+        if encoded.startswith("data:"):
+            header, separator, encoded = encoded.partition(",")
+            if not separator or ";base64" not in header.casefold():
+                raise PigGoCoreError("上传封面必须使用 Base64 编码")
+            mime = header[5:].split(";", 1)[0].casefold()
+            if mime not in {"image/jpeg", "image/png", "image/webp"}:
+                raise PigGoCoreError("封面格式仅支持 JPEG、PNG 或 WebP")
+        if not encoded or len(encoded) > (MAX_ARTWORK_BYTES * 4 // 3) + 16:
+            raise PigGoCoreError("上传封面为空或超过大小限制")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise PigGoCoreError("上传封面的 Base64 数据无效") from error
+        if not content or len(content) > MAX_ARTWORK_BYTES:
+            raise PigGoCoreError("上传封面为空或超过大小限制")
+        if content.startswith(b"\xff\xd8\xff"):
+            return content, ".jpg"
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return content, ".png"
+        if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+            return content, ".webp"
+        raise PigGoCoreError("封面文件签名无效或格式不受支持")
+
+    @staticmethod
+    def _task_artwork_cache_name(task: ImportTask, extension: str) -> str:
+        digest = hashlib.sha256(task.task_id.encode("utf-8")).hexdigest()[:32]
+        return f"{digest}{extension}"
+
+    @classmethod
+    def _cache_task_artwork(cls, task: ImportTask, content: bytes, extension: str) -> Path:
+        directory = Path(__file__).resolve().parent / "user-artwork"
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / cls._task_artwork_cache_name(task, extension)
+        temporary_name: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix=".upload-", suffix=".tmp", dir=directory, delete=False
+            ) as handle:
+                temporary_name = handle.name
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, target)
+            temporary_name = None
+            return target
+        finally:
+            if temporary_name:
+                try:
+                    Path(temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @classmethod
+    def _task_artwork_public_url(cls, task: ImportTask, extension: str) -> str:
+        name = cls._task_artwork_cache_name(task, extension)
+        return f"/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/{name}"
+
+    def _set_candidate_uploaded_artwork(self, task: ImportTask, artwork_url: str) -> None:
+        if not task.candidate_id:
+            return
+        with self._state_lock:
+            candidates = self._load_candidates()
+            for candidate in candidates:
+                if candidate.candidate_id == task.candidate_id:
+                    candidate.poster_url = artwork_url
+                    candidate.updated_at = utc_now()
+                    self._save_candidates(candidates)
+                    self._candidate_artwork_references[candidate.candidate_id] = (artwork_url,)
+                    return
+
+    def _restore_uploaded_artwork_cache(self) -> int:
+        """升级删除插件目录后，从媒体目录的 poster 重建历史小图副本。"""
+
+        restored = 0
+        for raw in self._load_tasks():
+            try:
+                task = ImportTask.from_dict(raw)
+            except (TypeError, ValueError):
+                continue
+            target_dir = self._history_target_dir(task)
+            poster = self._existing_poster(target_dir) if target_dir else None
+            if not poster or not poster.is_file():
+                continue
+            extension = poster.suffix.casefold()
+            if extension not in {".jpg", ".jpeg", ".png", ".webp"}:
+                continue
+            extension = ".jpg" if extension == ".jpeg" else extension
+            try:
+                content = poster.read_bytes()
+                if len(content) > MAX_ARTWORK_BYTES:
+                    continue
+                cache = self._cache_task_artwork(task, content, extension)
+                artwork_url = self._task_artwork_public_url(task, cache.suffix)
+                self._set_candidate_uploaded_artwork(task, artwork_url)
+                self._backfill_host_history_artwork(task, artwork_url)
+                restored += 1
+            except OSError:
+                continue
+        return restored
 
     def _restore_candidate_artwork_references(self, candidate_id: Optional[str]) -> None:
         """仅从已持久化候选恢复安全封面，绝不访问或刷新 RSS。"""
@@ -2067,6 +2189,35 @@ class PigGoKidsMetadata(_PluginBase):
             },
             message,
         )
+
+    def api_upload_task_artwork(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """接收用户图片，写入媒体目录并回填 MP 历史展示地址。"""
+
+        if not self._enabled:
+            return self._response(False, message="插件尚未启用")
+        values = dict(payload or {})
+        task = self._find_task(str(values.get("task_id") or "").strip())
+        if not task:
+            return self._response(False, message="任务不存在")
+        target_dir = self._history_target_dir(task)
+        if not target_dir:
+            return self._response(False, message="未从 MoviePilot 整理历史定位到本地媒体目录")
+        try:
+            content, extension = self._decode_uploaded_artwork(values.get("image_base64"))
+            poster = self._write_artwork(target_dir, content, extension)
+            cached_content = poster.read_bytes()
+            cache = self._cache_task_artwork(task, cached_content, poster.suffix.casefold())
+            artwork_url = self._task_artwork_public_url(task, cache.suffix)
+            self._set_candidate_uploaded_artwork(task, artwork_url)
+            history_updated = self._backfill_host_history_artwork(task, artwork_url)
+            return self._response(True, {
+                "task_id": task.task_id,
+                "poster_path": str(poster),
+                "artwork_url": artwork_url,
+                "history_images_updated": history_updated,
+            }, "封面已写入媒体目录并回填 MoviePilot 历史")
+        except (PigGoCoreError, OSError) as error:
+            return self._response(False, message=str(error))
 
     def api_reconcile_tasks(self, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         del payload
