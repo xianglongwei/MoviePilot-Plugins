@@ -441,6 +441,7 @@ class V2PluginContractTest(unittest.TestCase):
             self.assertTrue(calls[0]["manual"])
             self.assertTrue(calls[0]["background"])
             self.assertEqual(calls[0]["mediainfo"].source, "piggokids")
+            self.assertEqual(calls[0]["mediainfo"].category, "儿童动画")
 
     def test_synchronous_download_event_is_not_overwritten(self) -> None:
         plugin = self.module.PigGoKidsMetadata()
