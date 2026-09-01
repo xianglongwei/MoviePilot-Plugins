@@ -61,7 +61,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.4.0"
+    plugin_version = "0.4.1"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -1212,6 +1212,51 @@ class PigGoKidsMetadata(_PluginBase):
         if task.relative_source_path:
             self._scan_task(task, reason="transfer_failed_payload", allow_auto_transfer=False)
 
+    @staticmethod
+    def _record_values(record: Any) -> dict[str, Any]:
+        """把宿主模型或字典转换为只读字段映射。"""
+
+        if isinstance(record, dict):
+            return dict(record)
+        if callable(getattr(record, "model_dump", None)):
+            return dict(record.model_dump())
+        try:
+            return dict(vars(record))
+        except TypeError:
+            return {}
+
+    def _download_histories_by_hash(
+        self,
+        hashes: list[str],
+        *,
+        active_hashes: set[str],
+    ) -> dict[str, dict[str, Any]]:
+        """为已从下载器消失的任务读取 MoviePilot 下载历史。"""
+
+        missing_hashes = [value for value in hashes if value not in active_hashes]
+        if not missing_hashes:
+            return {}
+        try:
+            from app.db.downloadhistory_oper import DownloadHistoryOper
+
+            records = DownloadHistoryOper().get_by_hashes(missing_hashes) or {}
+        except (ImportError, AttributeError):
+            return {}
+        except Exception:
+            logger.error("PigGoKidsMetadata V2 下载历史恢复失败：unexpected_error")
+            return {}
+        if isinstance(records, dict):
+            entries = records.items()
+        else:
+            entries = ((None, record) for record in records)
+        histories: dict[str, dict[str, Any]] = {}
+        for key, record in entries:
+            values = self._record_values(record)
+            download_hash = normalize_download_hash(values.get("download_hash") or key)
+            if download_hash:
+                histories[download_hash] = values
+        return histories
+
     def reconcile_downloads(self) -> dict[str, Any]:
         if not self._enabled:
             return self._response(False, message="插件尚未启用")
@@ -1244,25 +1289,44 @@ class PigGoKidsMetadata(_PluginBase):
             return self._response(False, message="下载状态查询失败")
         by_hash = {}
         for torrent in torrents:
-            if isinstance(torrent, dict):
-                value = torrent
-            elif callable(getattr(torrent, "model_dump", None)):
-                value = torrent.model_dump()
-            else:
-                value = vars(torrent)
+            value = self._record_values(torrent)
             download_hash = normalize_download_hash(value.get("hash"))
             if download_hash:
                 by_hash[download_hash] = value
+        history_by_hash = self._download_histories_by_hash(
+            hashes,
+            active_hashes=set(by_hash),
+        )
         tracked = 0
         scanned = 0
+        history_recovered = 0
         for task in tasks:
             if task.state == TaskState.READY_TO_TRANSFER and self._auto_transfer:
                 decision = self._load_decisions().get(task.task_id)
                 if decision and self._start_host_transfer(task, decision)[0]:
                     tracked += 1
                 continue
-            torrent = by_hash.get(normalize_download_hash(task.download_hash) or "")
+            download_hash = normalize_download_hash(task.download_hash) or ""
+            torrent = by_hash.get(download_hash)
             if not torrent:
+                history = history_by_hash.get(download_hash)
+                if not history:
+                    continue
+                relative = self._relative_source_from_host_path(history.get("path"))
+                if not relative:
+                    continue
+                tracked += 1
+                history_recovered += 1
+                task.downloader = str(
+                    history.get("downloader") or task.downloader or ""
+                ) or None
+                task.relative_source_path = relative
+                self._save_task(task)
+                success, _, _ = self._scan_task(
+                    task,
+                    reason="download_history_payload",
+                )
+                scanned += int(success)
                 continue
             tracked += 1
             task.downloader = str(torrent.get("downloader") or task.downloader or "") or None
@@ -1280,7 +1344,11 @@ class PigGoKidsMetadata(_PluginBase):
             if task.relative_source_path:
                 success, _, _ = self._scan_task(task, reason="download_poll_completed")
                 scanned += int(success)
-        return self._response(True, {"tracked": tracked, "scanned": scanned})
+        return self._response(True, {
+            "tracked": tracked,
+            "scanned": scanned,
+            "history_recovered": history_recovered,
+        })
 
     @staticmethod
     def _response(success: bool, data: Optional[dict[str, Any]] = None, message: str = "") -> dict[str, Any]:

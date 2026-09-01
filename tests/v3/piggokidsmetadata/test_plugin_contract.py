@@ -611,6 +611,59 @@ class PluginContractTest(unittest.TestCase):
         self.assertEqual(calls[0]["hashs"], ["1" * 40])
         self.assertEqual(self.plugin.api_tasks().data["items"][0]["state"], "READY_TO_TRANSFER")
 
+    def test_restart_recovery_uses_download_history_when_torrent_is_gone(self) -> None:
+        imported = self.plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "2" * 40,
+            "title": "下载历史恢复样例",
+            "media_type": "movie",
+        })
+        candidate_id = imported.data["candidate"]["candidate_id"]
+        self.plugin._submit_download_to_host = lambda *_: "2" * 40
+        self.assertTrue(self.plugin.api_download_candidate({"candidate_id": candidate_id}).success)
+        history_calls = []
+
+        class FakeDownloadChain:
+            @staticmethod
+            def list_torrents(**_: Any) -> list[dict[str, Any]]:
+                return []
+
+        class FakeDownloadHistoryOper:
+            def get_by_hashes(self, hashes: list[str]) -> dict[str, Any]:
+                history_calls.append(hashes)
+                return {
+                    "2" * 40: types.SimpleNamespace(
+                        download_hash="2" * 40,
+                        path=str(self_root / "KidsMovie"),
+                        downloader="fake-downloader",
+                    )
+                }
+
+        self_root = self.root
+        chain = types.ModuleType("app.chain")
+        chain_download = types.ModuleType("app.chain.download")
+        chain_download.DownloadChain = FakeDownloadChain
+        app_db = types.ModuleType("app.db")
+        history_oper = types.ModuleType("app.db.downloadhistory_oper")
+        history_oper.DownloadHistoryOper = FakeDownloadHistoryOper
+        sys.modules.update({
+            "app.chain": chain,
+            "app.chain.download": chain_download,
+            "app.db": app_db,
+            "app.db.downloadhistory_oper": history_oper,
+        })
+        result = self.plugin.reconcile_downloads()
+        self.assertTrue(result["success"])
+        self.assertEqual(history_calls, [["2" * 40]])
+        self.assertEqual(result["data"]["history_recovered"], 1)
+        task = self.plugin.api_tasks().data["items"][0]
+        self.assertEqual(task["state"], "READY_TO_TRANSFER")
+        self.assertEqual(task["relative_source_path"], "KidsMovie")
+        self.assertEqual(task["downloader"], "fake-downloader")
+        self.assertIn(
+            "download_history_payload",
+            {entry["reason"] for entry in task["history"]},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
