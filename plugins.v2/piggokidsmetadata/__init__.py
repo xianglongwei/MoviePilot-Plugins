@@ -1290,7 +1290,11 @@ class PigGoKidsMetadata(_PluginBase):
                     None,
                 )
                 existing_url = str(getattr(candidate, "poster_url", "") or "")
-                expected_path = self._task_artwork_public_url(task, cache.suffix)
+                expected_path = self._task_artwork_public_url(
+                    task,
+                    cache.suffix,
+                    self._artwork_public_base_url,
+                )
                 artwork_url = existing_url if existing_url.endswith(expected_path) else expected_path
                 self._set_candidate_uploaded_artwork(task, artwork_url)
                 self._backfill_host_history_artwork(task, artwork_url)
@@ -1428,6 +1432,8 @@ class PigGoKidsMetadata(_PluginBase):
         except PigGoCoreError as error:
             return self._response(False, message=str(error))
         statuses = self._load_feed_status()
+        existing_candidates = self._load_candidates()
+        existing_by_id = {item.candidate_id: item for item in existing_candidates}
         incoming: list[FeedCandidate] = []
         parsed_count = 0
         successful = 0
@@ -1459,10 +1465,19 @@ class PigGoKidsMetadata(_PluginBase):
                         candidate_id,
                         artwork_base,
                     )
+                    previous = existing_by_id.get(candidate_id)
+                    previous_artwork = str(getattr(previous, "poster_url", "") or "")
+                    previous_is_local = (
+                        "/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/"
+                        in previous_artwork
+                    )
                     if cached_url:
                         item.candidate.poster_url = cached_url
                         self._candidate_artwork_references[candidate_id] = (cached_url,)
                         artwork_cache_hits += 1
+                    elif previous_is_local:
+                        item.candidate.poster_url = previous_artwork
+                        self._candidate_artwork_references[candidate_id] = (previous_artwork,)
                     elif (
                         self._requires_local_artwork_cache(item.candidate)
                         and artwork_cache_attempted < MAX_ARTWORK_CACHE_PER_REFRESH
@@ -1521,7 +1536,7 @@ class PigGoKidsMetadata(_PluginBase):
                 status["error_code"] = "unexpected_error"
                 logger.error("PigGoKidsMetadata V2 RSS 刷新失败：unexpected_error")
             statuses[feed_id] = status
-        merged = upsert_candidates(self._load_candidates(), incoming)
+        merged = upsert_candidates(existing_candidates, incoming)
         self._save_candidates(merged)
         self._save_feed_status(statuses)
         return self._response(

@@ -223,6 +223,44 @@ class V2PluginContractTest(unittest.TestCase):
             self.assertEqual(len(list((data_path / "artwork").glob("candidate-*.jpg"))), 1)
             self.assertNotIn(secret, json.dumps(plugin._plugin_data, ensure_ascii=False))
 
+    def test_rss_refresh_preserves_existing_local_artwork(self) -> None:
+        feeds = sys.modules[f"{self.module.__name__}.feeds"]
+        xml = """<rss><channel><item>
+          <title>已有本地封面</title>
+          <link>https://piggo.example/details.php?id=655</link>
+          <enclosure url="https://piggo.example/download.php?id=655" />
+          <description><![CDATA[
+            <img src="https://origin.piggo.me/poster/655.jpg" />
+          ]]></description>
+        </item></channel></rss>"""
+        candidate = feeds.parse_feed_document(
+            xml,
+            source_feed_id="feed:local-artwork",
+        )[0].candidate
+        local_url = (
+            "http://192.168.10.20:3001/api/v1/plugin/file/"
+            "PigGoKidsMetadata/user-artwork/existing.jpg"
+        )
+        candidate.poster_url = local_url
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({
+            "enabled": True,
+            "rss_urls": "https://piggo.example/rss.php",
+        })
+        plugin._save_candidates([candidate])
+        plugin._fetch_feed_content = lambda _: (xml.encode("utf-8"), 200)
+        plugin._fetch_artwork_content = mock.Mock(
+            side_effect=AssertionError("local artwork should not be downloaded again")
+        )
+
+        response = plugin.api_refresh_candidates({})
+
+        self.assertTrue(response["success"])
+        self.assertEqual(
+            plugin.api_candidates()["data"]["items"][0]["poster_url"],
+            local_url,
+        )
+
     def test_only_credential_free_https_artwork_is_shared_with_host(self) -> None:
         plugin = self.module.PigGoKidsMetadata()
         plugin.init_plugin({"enabled": True})
