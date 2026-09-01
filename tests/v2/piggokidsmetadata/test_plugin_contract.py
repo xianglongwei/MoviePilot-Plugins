@@ -184,6 +184,7 @@ class V2PluginContractTest(unittest.TestCase):
         plugin = self.module.PigGoKidsMetadata()
         plugin.init_plugin({"enabled": True})
         plugin._candidate_artwork_references["candidate:test"] = (
+            "https://m.ykimg.com/***",
             "https://images.example.test/poster.jpg?token=secret",
             "http://images.example.test/poster.jpg",
             "https://images.example.test/public/poster.jpg",
@@ -192,6 +193,53 @@ class V2PluginContractTest(unittest.TestCase):
             plugin._display_artwork_reference("candidate:test"),
             "https://images.example.test/public/poster.jpg",
         )
+
+    def test_existing_host_histories_receive_artwork(self) -> None:
+        class FakeHistory:
+            def __init__(self, *, poster: str = "", image: str = "") -> None:
+                self.poster = poster
+                self.image = image
+
+            def update(self, _: Any, payload: dict[str, Any]) -> None:
+                self.__dict__.update(payload)
+
+        download_history = FakeHistory()
+        transfer_histories = [FakeHistory(), FakeHistory(image="existing")]
+
+        class FakeDownloadHistoryOper:
+            _db = None
+
+            @staticmethod
+            def get_by_hash(_: str) -> Any:
+                return download_history
+
+        class FakeTransferHistoryOper:
+            _db = None
+
+            @staticmethod
+            def list_by_hash(_: str) -> list[Any]:
+                return transfer_histories
+
+        app_db = types.ModuleType("app.db")
+        download_oper = types.ModuleType("app.db.downloadhistory_oper")
+        download_oper.DownloadHistoryOper = FakeDownloadHistoryOper
+        transfer_oper = types.ModuleType("app.db.transferhistory_oper")
+        transfer_oper.TransferHistoryOper = FakeTransferHistoryOper
+        sys.modules.update({
+            "app.db": app_db,
+            "app.db.downloadhistory_oper": download_oper,
+            "app.db.transferhistory_oper": transfer_oper,
+        })
+        task = self.module.ImportTask(task_id="artwork", download_hash="a" * 40)
+        updated = self.module.PigGoKidsMetadata._backfill_host_history_artwork(
+            task,
+            "https://images.example.test/poster.jpg",
+        )
+        self.assertEqual(updated, 2)
+        self.assertEqual(download_history.poster, "https://images.example.test/poster.jpg")
+        self.assertEqual(download_history.image, "https://images.example.test/poster.jpg")
+        self.assertEqual(transfer_histories[0].image, "https://images.example.test/poster.jpg")
+        self.assertEqual(transfer_histories[1].image, "existing")
 
     def test_transfer_history_reconciles_missed_success_events(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

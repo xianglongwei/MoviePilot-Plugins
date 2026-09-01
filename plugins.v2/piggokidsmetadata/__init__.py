@@ -64,7 +64,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.6.0"
+    plugin_version = "0.6.1"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -850,6 +850,8 @@ class PigGoKidsMetadata(_PluginBase):
         """只把不含查询参数和凭据的 HTTPS 图片地址交给 MoviePilot 持久化。"""
 
         for reference in self._candidate_artwork_references.get(str(candidate_id or ""), ()):
+            if "***" in reference:
+                continue
             try:
                 parts = urlsplit(reference)
             except ValueError:
@@ -886,12 +888,12 @@ class PigGoKidsMetadata(_PluginBase):
                 if not getattr(download_history, "image", None):
                     payload["image"] = artwork_url
                 if payload:
-                    download_history.update(payload)
+                    download_history.update(download_oper._db, payload)
                     updated += 1
             transfer_oper = TransferHistoryOper()
             for history in transfer_oper.list_by_hash(task.download_hash) or []:
                 if not getattr(history, "image", None):
-                    history.update({"image": artwork_url})
+                    history.update(transfer_oper._db, {"image": artwork_url})
                     updated += 1
             return updated
         except Exception:
