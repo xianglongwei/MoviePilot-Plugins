@@ -64,7 +64,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.5.0"
+    plugin_version = "0.6.0"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -266,6 +266,13 @@ class PigGoKidsMetadata(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "从 RSS 为已整理任务补写本地封面",
+            },
+            {
+                "path": "/tasks/reconcile",
+                "endpoint": self.api_reconcile_tasks,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "根据 MoviePilot 历史恢复下载与整理任务状态",
             },
             {
                 "path": "/tasks/retry-action",
@@ -839,6 +846,58 @@ class PigGoKidsMetadata(_PluginBase):
                 logger.error("PigGoKidsMetadata V2 封面处理失败：unexpected_error")
         return False, None, "RSS 封面下载失败"
 
+    def _display_artwork_reference(self, candidate_id: Optional[str]) -> Optional[str]:
+        """只把不含查询参数和凭据的 HTTPS 图片地址交给 MoviePilot 持久化。"""
+
+        for reference in self._candidate_artwork_references.get(str(candidate_id or ""), ()):
+            try:
+                parts = urlsplit(reference)
+            except ValueError:
+                continue
+            if (
+                parts.scheme.casefold() == "https"
+                and parts.hostname
+                and not parts.username
+                and not parts.password
+                and not parts.query
+                and not parts.fragment
+                and len(reference) <= 2_048
+            ):
+                return reference
+        return None
+
+    @staticmethod
+    def _backfill_host_history_artwork(task: ImportTask, artwork_url: Optional[str]) -> int:
+        """为既有 MP 下载/整理历史补齐封面字段，不覆盖已有图片。"""
+
+        if not task.download_hash or not artwork_url:
+            return 0
+        updated = 0
+        try:
+            from app.db.downloadhistory_oper import DownloadHistoryOper
+            from app.db.transferhistory_oper import TransferHistoryOper
+
+            download_oper = DownloadHistoryOper()
+            download_history = download_oper.get_by_hash(task.download_hash)
+            if download_history:
+                payload = {}
+                if not getattr(download_history, "poster", None):
+                    payload["poster"] = artwork_url
+                if not getattr(download_history, "image", None):
+                    payload["image"] = artwork_url
+                if payload:
+                    download_history.update(payload)
+                    updated += 1
+            transfer_oper = TransferHistoryOper()
+            for history in transfer_oper.list_by_hash(task.download_hash) or []:
+                if not getattr(history, "image", None):
+                    history.update({"image": artwork_url})
+                    updated += 1
+            return updated
+        except Exception:
+            logger.error("PigGoKidsMetadata V2 历史封面回填失败：unexpected_error")
+            return 0
+
     def refresh_candidates(self) -> dict[str, Any]:
         if not self._enabled:
             return self._response(False, message="插件尚未启用")
@@ -922,7 +981,11 @@ class PigGoKidsMetadata(_PluginBase):
             MediaKind.TV: MediaType.TV,
         }.get(candidate.media_type, getattr(MediaType, "UNKNOWN", None))
         meta = MetaInfo(title=candidate.title, subtitle=candidate.summary)
-        media = MediaInfo(type=mtype, title=candidate.title)
+        media = MediaInfo(
+            type=mtype,
+            title=candidate.title,
+            poster_path=self._display_artwork_reference(candidate.candidate_id),
+        )
         torrent = TorrentInfo(
             site_name="PigGo",
             title=candidate.title,
@@ -1063,11 +1126,9 @@ class PigGoKidsMetadata(_PluginBase):
         except (OSError, RuntimeError, ValueError):
             return None
 
-    def _transfer_event_file_key(self, task: ImportTask, data: dict[str, Any]) -> Optional[str]:
-        """把宿主绝对文件路径映射为任务预期的安全相对文件键。"""
+    def _transfer_source_file_key(self, task: ImportTask, raw_path: Any) -> Optional[str]:
+        """把一个宿主源文件路径映射为任务预期的安全相对文件键。"""
 
-        fileitem = data.get("fileitem")
-        raw_path = getattr(fileitem, "path", None)
         relative: Optional[str] = None
         if self._scan_root and raw_path:
             try:
@@ -1090,6 +1151,15 @@ class PigGoKidsMetadata(_PluginBase):
             basename_matches = [item for item in expected if Path(item).name == Path(relative).name]
             if len(basename_matches) == 1:
                 return basename_matches[0]
+        return None
+
+    def _transfer_event_file_key(self, task: ImportTask, data: dict[str, Any]) -> Optional[str]:
+        """把宿主绝对文件路径映射为任务预期的安全相对文件键。"""
+
+        fileitem = data.get("fileitem")
+        raw_path = getattr(fileitem, "path", None)
+        if key := self._transfer_source_file_key(task, raw_path):
+            return key
         history_id = data.get("transfer_history_id")
         identity = str(history_id or raw_path or "").strip()
         if not identity:
@@ -1284,6 +1354,7 @@ class PigGoKidsMetadata(_PluginBase):
             names=list(item.get("aliases") or []),
             genres=[{"name": value} for value in item.get("genres") or []],
             number_of_episodes=item.get("episode_count") or 0,
+            poster_path=self._display_artwork_reference(getattr(task, "candidate_id", None)),
             # V2 在目标目录启用“按媒体类别建目录”时强制要求
             # MediaInfo.category。PigGo 本地身份没有 TMDB 辅助分类，
             # 因此使用与本插件整理预览一致的稳定类别。
@@ -1393,6 +1464,8 @@ class PigGoKidsMetadata(_PluginBase):
             task = self._find_task_by_hash(data.get("download_hash"))
             if task and task.state not in {TaskState.COMPLETED, TaskState.IGNORED}:
                 if self._record_transfer_result(task, data, success=True):
+                    artwork_url = self._display_artwork_reference(task.candidate_id)
+                    self._backfill_host_history_artwork(task, artwork_url)
                     if target_dir := self._event_target_dir(data):
                         self._install_task_artwork(task, target_dir)
                     self._advance_host_completed(task)
@@ -1493,6 +1566,67 @@ class PigGoKidsMetadata(_PluginBase):
                 histories[download_hash] = values
         return histories
 
+    def _reconcile_transfer_history(self, task: ImportTask) -> str:
+        """按 MP 整理历史恢复重载期间漏收的逐文件成功/失败事件。"""
+
+        if not task.download_hash:
+            return "pending"
+        try:
+            from app.db.transferhistory_oper import TransferHistoryOper
+
+            histories = TransferHistoryOper().list_by_hash(task.download_hash) or []
+        except (ImportError, AttributeError):
+            return "pending"
+        except Exception:
+            logger.error("PigGoKidsMetadata V2 整理历史恢复失败：unexpected_error")
+            return "pending"
+        expected = set(task.transfer_expected_files) or {
+            Path(item).as_posix()
+            for item in task.torrent_files
+            if Path(item).suffix.casefold() in VIDEO_EXTENSIONS
+        }
+        if not expected:
+            return "pending"
+        latest_by_key: dict[str, tuple[int, bool]] = {}
+        for history in histories:
+            values = self._record_values(history)
+            key = self._transfer_source_file_key(task, values.get("src"))
+            if not key or key not in expected:
+                continue
+            try:
+                history_id = int(values.get("id") or 0)
+            except (TypeError, ValueError):
+                history_id = 0
+            previous = latest_by_key.get(key)
+            if previous is None or history_id >= previous[0]:
+                latest_by_key[key] = (history_id, bool(values.get("status")))
+        succeeded = {key for key, (_, status) in latest_by_key.items() if status}
+        failed = {key for key, (_, status) in latest_by_key.items() if not status}
+        task.transfer_completed_files = sorted(succeeded)
+        task.transfer_failed_files = sorted(failed)
+        self._save_task(task)
+        if expected.issubset(succeeded):
+            if task.candidate_id and not self._candidate_artwork_references.get(task.candidate_id):
+                self.refresh_candidates()
+            artwork_url = self._display_artwork_reference(task.candidate_id)
+            self._backfill_host_history_artwork(task, artwork_url)
+            if target_dir := self._history_target_dir(task):
+                self._install_task_artwork(task, target_dir)
+            self._advance_host_completed(task)
+            return "completed"
+        if expected.issubset(succeeded | failed) and failed:
+            if task.state != TaskState.RETRYABLE_FAILED:
+                task.transition(TaskState.RETRYABLE_FAILED, "transfer_history_failed")
+            task.last_error_code = "host_transfer_failed"
+            self._save_task(task)
+            self._update_candidate(
+                task.candidate_id,
+                status=CandidateStatus.FAILED,
+                task_id=task.task_id,
+            )
+            return "failed"
+        return "pending"
+
     def reconcile_downloads(self) -> dict[str, Any]:
         if not self._enabled:
             return self._response(False, message="插件尚未启用")
@@ -1536,7 +1670,17 @@ class PigGoKidsMetadata(_PluginBase):
         tracked = 0
         scanned = 0
         history_recovered = 0
+        transfer_completed = 0
+        transfer_failed = 0
+        transfer_pending = 0
         for task in tasks:
+            if task.state in {TaskState.TRANSFERRING, TaskState.LIBRARY_REFRESHING}:
+                outcome = self._reconcile_transfer_history(task)
+                transfer_completed += int(outcome == "completed")
+                transfer_failed += int(outcome == "failed")
+                transfer_pending += int(outcome == "pending")
+                tracked += 1
+                continue
             if task.state == TaskState.READY_TO_TRANSFER and self._auto_transfer:
                 decision = self._load_decisions().get(task.task_id)
                 if decision and self._start_host_transfer(task, decision)[0]:
@@ -1580,6 +1724,9 @@ class PigGoKidsMetadata(_PluginBase):
             "tracked": tracked,
             "scanned": scanned,
             "history_recovered": history_recovered,
+            "transfer_completed": transfer_completed,
+            "transfer_failed": transfer_failed,
+            "transfer_pending": transfer_pending,
         })
 
     @staticmethod
@@ -1701,12 +1848,24 @@ class PigGoKidsMetadata(_PluginBase):
             refreshed = self.refresh_candidates()
             if not refreshed.get("success"):
                 return self._response(False, message="RSS 刷新失败，暂时无法恢复封面链接")
+        history_updated = self._backfill_host_history_artwork(
+            task,
+            self._display_artwork_reference(task.candidate_id),
+        )
         success, path, message = self._install_task_artwork(task, target_dir)
         return self._response(
             success,
-            {"task_id": task.task_id, "poster_path": str(path) if path else None},
+            {
+                "task_id": task.task_id,
+                "poster_path": str(path) if path else None,
+                "history_images_updated": history_updated,
+            },
             message,
         )
+
+    def api_reconcile_tasks(self, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        del payload
+        return self.reconcile_downloads()
 
     def api_import_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._enabled:

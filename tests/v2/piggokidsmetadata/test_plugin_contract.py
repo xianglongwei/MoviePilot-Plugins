@@ -131,7 +131,7 @@ class V2PluginContractTest(unittest.TestCase):
                 "/candidates/refresh", "/candidates/import", "/candidates/ignore", "/candidates/update",
                 "/candidates/download",
                 "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/review",
-                "/tasks/artwork", "/tasks/retry-action",
+                "/tasks/artwork", "/tasks/reconcile", "/tasks/retry-action",
             })
             with mock.patch.object(self.module.Path, "is_file", return_value=False):
                 self.assertEqual(plugin.get_render_mode(), ("vuetify", ""))
@@ -179,6 +179,70 @@ class V2PluginContractTest(unittest.TestCase):
             "abcdefghijklmnopqrstuvwxyz123456",
             str(item.candidate.to_dict()),
         )
+
+    def test_only_credential_free_https_artwork_is_shared_with_host(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        plugin._candidate_artwork_references["candidate:test"] = (
+            "https://images.example.test/poster.jpg?token=secret",
+            "http://images.example.test/poster.jpg",
+            "https://images.example.test/public/poster.jpg",
+        )
+        self.assertEqual(
+            plugin._display_artwork_reference("candidate:test"),
+            "https://images.example.test/public/poster.jpg",
+        )
+
+    def test_transfer_history_reconciles_missed_success_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "Show"
+            target = root / "Library" / "Show (2026)" / "Season 1"
+            source.mkdir()
+            target.mkdir(parents=True)
+            expected = []
+            histories = []
+            for episode in (1, 2):
+                source_file = source / f"Show.S01E{episode:02d}.mp4"
+                target_file = target / f"Show S01E{episode:02d}.mp4"
+                source_file.write_bytes(b"")
+                target_file.write_bytes(b"")
+                expected.append(source_file.relative_to(root).as_posix())
+                histories.append(types.SimpleNamespace(
+                    id=episode,
+                    src=str(source_file),
+                    dest=str(target_file),
+                    dest_storage="local",
+                    status=True,
+                    type=FakeMediaType.TV.value,
+                ))
+
+            class FakeTransferHistoryOper:
+                @staticmethod
+                def list_by_hash(_: str) -> list[Any]:
+                    return histories
+
+            app_db = types.ModuleType("app.db")
+            transfer_oper = types.ModuleType("app.db.transferhistory_oper")
+            transfer_oper.TransferHistoryOper = FakeTransferHistoryOper
+            sys.modules.update({
+                "app.db": app_db,
+                "app.db.transferhistory_oper": transfer_oper,
+            })
+            plugin = self.module.PigGoKidsMetadata()
+            plugin.init_plugin({"enabled": True, "scan_root": str(root)})
+            task = self.module.ImportTask(
+                task_id="transfer-reconcile",
+                state=self.module.TaskState.TRANSFERRING,
+                download_hash="a" * 40,
+                relative_source_path="Show",
+                transfer_expected_files=expected,
+            )
+            plugin._save_task(task)
+            self.assertEqual(plugin._reconcile_transfer_history(task), "completed")
+            restored = plugin._find_task(task.task_id)
+            self.assertEqual(restored.state, self.module.TaskState.COMPLETED)
+            self.assertEqual(restored.transfer_completed_files, expected)
 
     def test_conflict_review_requires_explicit_transfer_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
