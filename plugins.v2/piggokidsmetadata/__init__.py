@@ -66,7 +66,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.3"
+    plugin_version = "0.7.4"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -117,6 +117,7 @@ class PigGoKidsMetadata(_PluginBase):
             self._max_files = max(100, min(50_000, int(values.get("max_files", 10_000))))
         except (TypeError, ValueError):
             self._max_files = 10_000
+        self._repair_placeholder_download_titles()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -669,6 +670,30 @@ class PigGoKidsMetadata(_PluginBase):
         except Exception:
             logger.error("PigGoKidsMetadata V2 下载名称恢复失败：unexpected_error")
         return None
+
+    def _repair_placeholder_download_titles(self) -> int:
+        """插件加载时修复既有已完成任务的 download.php 占位标题。"""
+
+        repaired = 0
+        for raw in self._load_tasks():
+            try:
+                task = ImportTask.from_dict(raw)
+            except (TypeError, ValueError):
+                continue
+            if not task.relative_source_path:
+                continue
+            candidate = next(
+                (
+                    item for item in self._load_candidates()
+                    if item.candidate_id == task.candidate_id
+                ),
+                None,
+            )
+            if not candidate or not self._is_placeholder_download_title(candidate.title):
+                continue
+            if self._adopt_download_name(task, Path(task.relative_source_path).name):
+                repaired += 1
+        return repaired
 
     def _save_decision(self, task_id: str, decision: dict[str, Any]) -> None:
         with self._state_lock:
