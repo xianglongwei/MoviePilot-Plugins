@@ -64,7 +64,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.0"
+    plugin_version = "0.7.1"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -427,7 +427,8 @@ class PigGoKidsMetadata(_PluginBase):
                     "component": "VImg",
                     "props": {
                         "src": poster_url,
-                        "height": 180,
+                        "width": 92,
+                        "height": 124,
                         "cover": True,
                         "class": "mx-4 mt-3 rounded",
                     },
@@ -1879,7 +1880,7 @@ class PigGoKidsMetadata(_PluginBase):
         status_value = str(status or "").casefold()
         type_value = str(media_type or "").casefold()
         try:
-            safe_limit = max(1, min(500, int(limit or 100)))
+            safe_limit = max(1, min(MAX_CANDIDATE_ITEMS, int(limit or 100)))
         except (TypeError, ValueError):
             safe_limit = 100
         candidates = self._load_candidates()

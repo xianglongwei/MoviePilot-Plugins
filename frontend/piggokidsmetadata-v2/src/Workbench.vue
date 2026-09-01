@@ -207,33 +207,38 @@
         >
         <VRow v-else>
           <VCol
-            v-for="candidate in filteredCandidates"
+            v-for="candidate in pagedCandidates"
             :key="candidate.candidate_id"
             cols="12"
             md="6"
             xl="4"
           >
             <VCard variant="outlined" height="100%">
-              <VImg
-                v-if="candidate.poster_url"
-                :src="candidate.poster_url"
-                height="210"
-                cover
-                class="candidate-poster"
-              >
-                <template #placeholder>
-                  <div class="candidate-poster-placeholder">
-                    <VProgressCircular indeterminate color="primary" />
-                  </div>
-                </template>
-              </VImg>
-              <VCardTitle class="candidate-title">{{
-                candidate.title
-              }}</VCardTitle>
-              <VCardSubtitle
-                >{{ mediaTypeLabel(candidate.media_type) }} ·
-                {{ sizeLabel(candidate.size_bytes) }}</VCardSubtitle
-              >
+              <div class="candidate-header">
+                <VImg
+                  v-if="candidate.poster_url"
+                  :src="candidate.poster_url"
+                  width="92"
+                  height="124"
+                  cover
+                  class="candidate-poster"
+                >
+                  <template #placeholder>
+                    <div class="candidate-poster-placeholder">
+                      <VProgressCircular indeterminate color="primary" size="24" />
+                    </div>
+                  </template>
+                </VImg>
+                <div class="candidate-heading">
+                  <VCardTitle class="candidate-title">{{
+                    candidate.title
+                  }}</VCardTitle>
+                  <VCardSubtitle
+                    >{{ mediaTypeLabel(candidate.media_type) }} ·
+                    {{ sizeLabel(candidate.size_bytes) }}</VCardSubtitle
+                  >
+                </div>
+              </div>
               <VCardText>
                 <div class="d-flex flex-wrap ga-2 mb-2">
                   <VChip
@@ -317,6 +322,17 @@
             </VCard>
           </VCol>
         </VRow>
+        <div
+          v-if="filteredCandidates.length > candidatePageSize"
+          class="d-flex justify-center mt-4"
+        >
+          <VPagination
+            v-model="candidatePage"
+            :length="candidatePageCount"
+            :total-visible="7"
+            density="comfortable"
+          />
+        </div>
       </VWindowItem>
 
       <VWindowItem value="tasks">
@@ -626,7 +642,7 @@
 </template>
 
 <script setup>
-import { computed, inject, onMounted, reactive, ref } from "vue";
+import { computed, inject, onMounted, reactive, ref, watch } from "vue";
 import { createPluginApi, messageOf } from "./api";
 import { filterCandidates, filterTasks, maskHash } from "./workflow";
 
@@ -654,6 +670,8 @@ const candidateStatus = ref(null);
 const candidateType = ref(null);
 const candidateCategory = ref(null);
 const candidateAge = ref("all");
+const candidatePage = ref(1);
+const candidatePageSize = 24;
 const taskFilter = ref("all");
 const showDownloadReference = ref(false);
 const editDialog = ref(false);
@@ -729,6 +747,22 @@ const filteredCandidates = computed(() => {
     ageDays: candidateAge.value,
   });
 });
+const candidatePageCount = computed(() =>
+  Math.max(1, Math.ceil(filteredCandidates.value.length / candidatePageSize)),
+);
+const pagedCandidates = computed(() => {
+  const offset = (candidatePage.value - 1) * candidatePageSize;
+  return filteredCandidates.value.slice(offset, offset + candidatePageSize);
+});
+watch(
+  [query, candidateStatus, candidateType, candidateCategory, candidateAge],
+  () => {
+    candidatePage.value = 1;
+  },
+);
+watch(candidatePageCount, (count) => {
+  if (candidatePage.value > count) candidatePage.value = count;
+});
 const visibleTasks = computed(() => filterTasks(tasks.value, taskFilter.value));
 
 function notify(message, color = "success") {
@@ -742,7 +776,7 @@ async function loadAll() {
     const [statusData, candidateData, taskData, draftData, feedData] =
       await Promise.all([
         client.get("/status"),
-        client.get("/candidates?limit=500"),
+        client.get("/candidates?limit=1000"),
         client.get("/tasks"),
         client.get("/contribution-drafts"),
         client.get("/feeds"),
@@ -1053,8 +1087,20 @@ onMounted(loadAll);
   white-space: normal;
   line-height: 1.4;
 }
+.candidate-header {
+  display: flex;
+  align-items: flex-start;
+  min-width: 0;
+}
+.candidate-heading {
+  flex: 1 1 auto;
+  min-width: 0;
+}
 .candidate-poster {
-  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  flex: 0 0 92px;
+  margin: 12px 0 0 12px;
+  border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  border-radius: 8px;
   background: rgb(var(--v-theme-surface-variant));
 }
 .candidate-poster-placeholder {
