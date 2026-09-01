@@ -7,6 +7,7 @@ RSS、种子或磁力链接只存在于一次请求的内存中，由宿主适�
 from __future__ import annotations
 
 import hashlib
+import html
 import ipaddress
 import re
 import socket
@@ -31,6 +32,9 @@ _SITE_ID_PATH = re.compile(
 )
 _TV_HINT = re.compile(r"(?i)(?:^|[. _\-\[(])S\d{1,2}(?:E\d{1,3})?(?:$|[. _\-\])])")
 _BTIH = re.compile(r"(?i)(?:^|&)xt=urn:btih:([a-z0-9]{32,40})(?:&|$)")
+_IMAGE_SOURCE = re.compile(
+    r'''(?is)<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'<>`]+))'''
+)
 
 
 class FeedParseError(PigGoCoreError):
@@ -283,10 +287,38 @@ class FeedCandidate:
 
 @dataclass
 class ParsedCandidate:
-    """一次 RSS 解析的瞬态结果；``download_reference`` 绝不持久化。"""
+    """一次 RSS 解析的瞬态结果；完整下载和图片引用绝不持久化。"""
 
     candidate: FeedCandidate
     download_reference: str = field(repr=False)
+    artwork_references: tuple[str, ...] = field(default_factory=tuple, repr=False)
+
+
+def _extract_artwork_references(description: str, *, maximum: int = 4) -> tuple[str, ...]:
+    """从 RSS HTML 摘要提取瞬态公网图片 URL，不在解析阶段触发 DNS。"""
+
+    references: list[str] = []
+    for match in _IMAGE_SOURCE.finditer(html.unescape(str(description or ""))):
+        value = next((item for item in match.groups() if item), "").strip()
+        if not value or len(value) > MAX_REFERENCE_LENGTH:
+            continue
+        try:
+            value = validate_feed_url(value)
+        except InvalidReferenceError:
+            continue
+        hostname = str(urlsplit(value).hostname or "").casefold().rstrip(".")
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            continue
+        try:
+            if not ipaddress.ip_address(hostname).is_global:
+                continue
+        except ValueError:
+            pass
+        if value not in references:
+            references.append(value)
+        if len(references) >= max(1, min(10, int(maximum))):
+            break
+    return tuple(references)
 
 
 def _entry_links(entry: ET.Element) -> tuple[str, str, Optional[int]]:
@@ -382,7 +414,11 @@ def parse_feed_document(
             detail_url=redact_url(detail) if detail else None,
             download_url=redact_url(download),
         )
-        results.append(ParsedCandidate(candidate=candidate, download_reference=download))
+        results.append(ParsedCandidate(
+            candidate=candidate,
+            download_reference=download,
+            artwork_references=_extract_artwork_references(description),
+        ))
     return results
 
 

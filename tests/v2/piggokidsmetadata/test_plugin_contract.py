@@ -131,7 +131,7 @@ class V2PluginContractTest(unittest.TestCase):
                 "/candidates/refresh", "/candidates/import", "/candidates/ignore", "/candidates/update",
                 "/candidates/download",
                 "/candidates/download-action", "/tasks", "/tasks/retry", "/tasks/review",
-                "/tasks/retry-action",
+                "/tasks/artwork", "/tasks/retry-action",
             })
             with mock.patch.object(self.module.Path, "is_file", return_value=False):
                 self.assertEqual(plugin.get_render_mode(), ("vuetify", ""))

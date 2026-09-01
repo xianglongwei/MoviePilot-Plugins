@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -52,6 +54,7 @@ CANDIDATES_KEY = "feed_candidates_v1"
 FEED_STATUS_KEY = "feed_status_v1"
 MAX_REGISTRY_ITEMS = 500
 MAX_CANDIDATE_ITEMS = 1_000
+MAX_ARTWORK_BYTES = 8 * 1024 * 1024
 DOWNLOAD_SOURCE = "PigGoKidsMetadata"
 
 
@@ -61,7 +64,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.4.4"
+    plugin_version = "0.5.0"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -94,6 +97,7 @@ class PigGoKidsMetadata(_PluginBase):
         self._state_lock = threading.RLock()
         self._submission_lock = threading.RLock()
         self._candidate_download_references: dict[str, str] = {}
+        self._candidate_artwork_references: dict[str, tuple[str, ...]] = {}
         self._active_submission_task_id: Optional[str] = None
         try:
             self._rss_urls = parse_feed_urls_config(values.get("rss_urls"))
@@ -255,6 +259,13 @@ class PigGoKidsMetadata(_PluginBase):
                 "methods": ["POST"],
                 "auth": "bear",
                 "summary": "批准或忽略待人工审核任务",
+            },
+            {
+                "path": "/tasks/artwork",
+                "endpoint": self.api_task_artwork,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "从 RSS 为已整理任务补写本地封面",
             },
             {
                 "path": "/tasks/retry-action",
@@ -640,6 +651,194 @@ class PigGoKidsMetadata(_PluginBase):
                     close()
         raise PigGoCoreError("RSS 重定向次数过多")
 
+    @staticmethod
+    def _fetch_artwork_content(url: str) -> tuple[bytes, str]:
+        """下载并校验一张公网图片，限制重定向、类型和响应大小。"""
+
+        from app.utils.http import RequestUtils
+
+        current_url = url
+        headers = {
+            "User-Agent": "Mozilla/5.0 (MoviePilot PigGoKidsMetadata)",
+            "Accept": "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8",
+        }
+        for _ in range(6):
+            validate_public_http_url(current_url)
+            response = RequestUtils(headers=headers, timeout=20).get_res(
+                current_url,
+                stream=True,
+                allow_redirects=False,
+            )
+            if response is None:
+                raise PigGoCoreError("封面请求没有返回响应")
+            try:
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                if status_code in {301, 302, 303, 307, 308}:
+                    location = str((getattr(response, "headers", {}) or {}).get("Location") or "")
+                    if not location:
+                        raise PigGoCoreError("封面重定向缺少目标地址")
+                    current_url = urljoin(current_url, location)
+                    continue
+                if status_code != 200:
+                    raise PigGoCoreError(f"封面请求返回 HTTP {status_code or 'unknown'}")
+                response_headers = getattr(response, "headers", {}) or {}
+                content_type = str(response_headers.get("Content-Type") or "").split(";", 1)[0].casefold()
+                if content_type and content_type not in {
+                    "image/jpeg", "image/png", "image/webp", "application/octet-stream",
+                }:
+                    raise PigGoCoreError("封面响应不是受支持的图片类型")
+                try:
+                    content_length = int(response_headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    content_length = 0
+                if content_length > MAX_ARTWORK_BYTES:
+                    raise PigGoCoreError("封面超过安全大小限制")
+                chunks: list[bytes] = []
+                total = 0
+                iterator = getattr(response, "iter_content", None)
+                source = (
+                    iterator(chunk_size=64 * 1024)
+                    if callable(iterator)
+                    else [getattr(response, "content", b"")]
+                )
+                for chunk in source:
+                    data = bytes(chunk or b"")
+                    total += len(data)
+                    if total > MAX_ARTWORK_BYTES:
+                        raise PigGoCoreError("封面超过安全大小限制")
+                    chunks.append(data)
+                content = b"".join(chunks)
+                if content.startswith(b"\xff\xd8\xff"):
+                    extension = ".jpg"
+                elif content.startswith(b"\x89PNG\r\n\x1a\n"):
+                    extension = ".png"
+                elif len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+                    extension = ".webp"
+                else:
+                    raise PigGoCoreError("封面文件签名无效或格式不受支持")
+                return content, extension
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+        raise PigGoCoreError("封面重定向次数过多")
+
+    @staticmethod
+    def _existing_poster(target_dir: Path) -> Optional[Path]:
+        for name in ("poster.jpg", "poster.jpeg", "poster.png", "poster.webp"):
+            candidate = target_dir / name
+            if candidate.exists() or candidate.is_symlink():
+                return candidate
+        return None
+
+    @classmethod
+    def _write_artwork(cls, target_dir: Path, content: bytes, extension: str) -> Path:
+        """以原子替换写入 poster，且不覆盖已有的人工封面。"""
+
+        directory = target_dir.expanduser().resolve(strict=True)
+        if not directory.is_dir():
+            raise PigGoCoreError("整理目标不是本地目录")
+        if existing := cls._existing_poster(directory):
+            return existing
+        temporary_name: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".piggokids-poster-",
+                suffix=".tmp",
+                dir=directory,
+                delete=False,
+            ) as handle:
+                temporary_name = handle.name
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            target = directory / f"poster{extension}"
+            os.replace(temporary_name, target)
+            temporary_name = None
+            return target
+        finally:
+            if temporary_name:
+                try:
+                    Path(temporary_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _event_target_dir(data: dict[str, Any]) -> Optional[Path]:
+        transferinfo = data.get("transferinfo")
+        directory_item = getattr(transferinfo, "target_diritem", None)
+        storage = str(getattr(directory_item, "storage", "") or "").casefold()
+        path = getattr(directory_item, "path", None)
+        if not path or storage not in {"", "local"}:
+            return None
+        try:
+            directory = Path(str(path)).expanduser().resolve(strict=True)
+            return directory if directory.is_dir() else None
+        except (OSError, RuntimeError, ValueError):
+            return None
+
+    @staticmethod
+    def _history_target_dir(task: ImportTask) -> Optional[Path]:
+        if not task.download_hash:
+            return None
+        try:
+            from app.db.transferhistory_oper import TransferHistoryOper
+
+            histories = TransferHistoryOper().list_by_hash(task.download_hash)
+        except Exception:
+            return None
+        parents: list[Path] = []
+        media_type = ""
+        for history in histories or []:
+            if not bool(getattr(history, "status", False)):
+                continue
+            storage = str(getattr(history, "dest_storage", "") or "").casefold()
+            destination = getattr(history, "dest", None)
+            if not destination or storage not in {"", "local"}:
+                continue
+            try:
+                parent = Path(str(destination)).expanduser().parent.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if parent.is_dir():
+                parents.append(parent)
+                media_type = media_type or str(getattr(history, "type", "") or "")
+        if not parents:
+            return None
+        try:
+            common = Path(os.path.commonpath([str(path) for path in parents]))
+        except (OSError, ValueError):
+            return None
+        if media_type in {MediaType.TV.value, "tv"} and common.name.casefold().startswith("season "):
+            common = common.parent
+        return common if common.is_dir() else None
+
+    def _install_task_artwork(
+        self,
+        task: ImportTask,
+        target_dir: Path,
+    ) -> tuple[bool, Optional[Path], str]:
+        try:
+            directory = target_dir.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return False, None, "整理目标目录不存在"
+        if existing := self._existing_poster(directory):
+            return True, existing, "目标目录已有封面"
+        references = self._candidate_artwork_references.get(str(task.candidate_id or ""), ())
+        if not references:
+            return False, None, "RSS 候选中没有可用封面"
+        for reference in references:
+            try:
+                content, extension = self._fetch_artwork_content(reference)
+                target = self._write_artwork(directory, content, extension)
+                return True, target, "封面已写入媒体目录"
+            except (InvalidReferenceError, PigGoCoreError, OSError):
+                continue
+            except Exception:
+                logger.error("PigGoKidsMetadata V2 封面处理失败：unexpected_error")
+        return False, None, "RSS 封面下载失败"
+
     def refresh_candidates(self) -> dict[str, Any]:
         if not self._enabled:
             return self._response(False, message="插件尚未启用")
@@ -665,6 +864,7 @@ class PigGoKidsMetadata(_PluginBase):
                 parsed = parse_feed_document(content, source_feed_id=feed_id)
                 for item in parsed:
                     self._candidate_download_references[item.candidate.candidate_id] = item.download_reference
+                    self._candidate_artwork_references[item.candidate.candidate_id] = item.artwork_references
                     incoming.append(item.candidate)
                 status.update({
                     "last_success_at": utc_now(),
@@ -1193,6 +1393,8 @@ class PigGoKidsMetadata(_PluginBase):
             task = self._find_task_by_hash(data.get("download_hash"))
             if task and task.state not in {TaskState.COMPLETED, TaskState.IGNORED}:
                 if self._record_transfer_result(task, data, success=True):
+                    if target_dir := self._event_target_dir(data):
+                        self._install_task_artwork(task, target_dir)
                     self._advance_host_completed(task)
 
     @eventmanager.register(EventType.TransferFailed)
@@ -1480,6 +1682,31 @@ class PigGoKidsMetadata(_PluginBase):
     def api_refresh_candidates(self, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         del payload
         return self.refresh_candidates()
+
+    def api_task_artwork(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """根据整理历史定位媒体根目录，并为一个任务补写 RSS 封面。"""
+
+        if not self._enabled:
+            return self._response(False, message="插件尚未启用")
+        task_id = str(dict(payload or {}).get("task_id") or "").strip()
+        task = self._find_task(task_id)
+        if not task:
+            return self._response(False, message="任务不存在")
+        if not task.candidate_id:
+            return self._response(False, message="任务没有关联 RSS 候选")
+        target_dir = self._history_target_dir(task)
+        if not target_dir:
+            return self._response(False, message="未从 MoviePilot 整理历史定位到本地媒体目录")
+        if not self._candidate_artwork_references.get(task.candidate_id):
+            refreshed = self.refresh_candidates()
+            if not refreshed.get("success"):
+                return self._response(False, message="RSS 刷新失败，暂时无法恢复封面链接")
+        success, path, message = self._install_task_artwork(task, target_dir)
+        return self._response(
+            success,
+            {"task_id": task.task_id, "poster_path": str(path) if path else None},
+            message,
+        )
 
     def api_import_candidate(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self._enabled:
