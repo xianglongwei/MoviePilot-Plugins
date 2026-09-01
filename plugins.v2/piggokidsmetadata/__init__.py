@@ -64,7 +64,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -839,6 +839,41 @@ class PigGoKidsMetadata(_PluginBase):
                 logger.error("PigGoKidsMetadata V2 封面处理失败：unexpected_error")
         return False, None, "RSS 封面下载失败"
 
+    def _refresh_task_media_library(self, task: ImportTask, target_dir: Path) -> bool:
+        """封面落盘后请求已配置的媒体服务器刷新对应节目或所在媒体库。"""
+
+        decision = self._load_decisions().get(task.task_id) or {}
+        item = decision.get("item") if isinstance(decision, dict) else None
+        if not isinstance(item, dict):
+            return False
+        title = str(item.get("title") or "").strip()
+        year = item.get("year")
+        kind = str(item.get("media_type") or "").casefold()
+        media_type = {
+            MediaKind.TV.value: MediaType.TV,
+            MediaKind.MOVIE.value: MediaType.MOVIE,
+        }.get(kind)
+        if not title or not year or not media_type:
+            return False
+        try:
+            from app.chain.mediaserver import MediaServerChain
+
+            refresh_item = schemas.RefreshMediaItem(
+                title=title,
+                year=year,
+                type=media_type,
+                category="儿童动画" if media_type == MediaType.TV else "儿童动画电影",
+                target_path=target_dir,
+            )
+            result = MediaServerChain().run_module(
+                "refresh_library_by_items",
+                items=[refresh_item],
+            )
+            return result is not False
+        except Exception:
+            logger.error("PigGoKidsMetadata V2 媒体库刷新失败：unexpected_error")
+            return False
+
     def refresh_candidates(self) -> dict[str, Any]:
         if not self._enabled:
             return self._response(False, message="插件尚未启用")
@@ -1394,7 +1429,9 @@ class PigGoKidsMetadata(_PluginBase):
             if task and task.state not in {TaskState.COMPLETED, TaskState.IGNORED}:
                 if self._record_transfer_result(task, data, success=True):
                     if target_dir := self._event_target_dir(data):
-                        self._install_task_artwork(task, target_dir)
+                        installed, _, _ = self._install_task_artwork(task, target_dir)
+                        if installed:
+                            self._refresh_task_media_library(task, target_dir)
                     self._advance_host_completed(task)
 
     @eventmanager.register(EventType.TransferFailed)
@@ -1702,9 +1739,16 @@ class PigGoKidsMetadata(_PluginBase):
             if not refreshed.get("success"):
                 return self._response(False, message="RSS 刷新失败，暂时无法恢复封面链接")
         success, path, message = self._install_task_artwork(task, target_dir)
+        library_refresh_requested = (
+            self._refresh_task_media_library(task, target_dir) if success else False
+        )
         return self._response(
             success,
-            {"task_id": task.task_id, "poster_path": str(path) if path else None},
+            {
+                "task_id": task.task_id,
+                "poster_path": str(path) if path else None,
+                "library_refresh_requested": library_refresh_requested,
+            },
             message,
         )
 
