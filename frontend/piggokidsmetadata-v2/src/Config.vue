@@ -2,7 +2,7 @@
   <VForm ref="form" @submit.prevent="save">
     <VAlert type="info" variant="tonal" class="mb-4">
       完整的
-      RSS、候选、任务和冲突审核界面位于插件页面。私密下载链接不会写入持久化记录。
+      RSS、候选和任务界面位于插件页面。插件提交的下载会由本地元数据自动识别并整理，私密下载链接不会写入持久化记录。
     </VAlert>
 
     <VSwitch v-model="config.enabled" label="启用插件" color="primary" />
@@ -74,9 +74,9 @@
     />
     <VSwitch
       v-model="config.auto_transfer"
-      label="高置信度任务自动整理"
+      label="手工扫描的高置信度任务自动整理"
       color="warning"
-      hint="建议先保持关闭，在任务页确认识别结果后手动整理"
+      hint="RSS 或插件提交的下载固定由插件自动识别整理，不受此开关影响"
       persistent-hint
     />
 

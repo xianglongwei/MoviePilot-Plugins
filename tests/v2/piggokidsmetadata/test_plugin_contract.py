@@ -194,6 +194,46 @@ class V2PluginContractTest(unittest.TestCase):
             "https://images.example.test/public/poster.jpg",
         )
 
+    def test_candidate_api_exposes_safe_transient_poster(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        imported = plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "7" * 40,
+            "title": "海报候选",
+        })
+        candidate_id = imported["data"]["candidate"]["candidate_id"]
+        plugin._candidate_artwork_references[candidate_id] = (
+            "https://m.ykimg.com/***",
+            "https://images.example.test/poster.jpg",
+        )
+        candidate = plugin.api_candidates()["data"]["items"][0]
+        self.assertEqual(candidate["poster_url"], "https://images.example.test/poster.jpg")
+
+    def test_plugin_download_is_reserved_from_host_auto_transfer(self) -> None:
+        calls = []
+
+        class FakeDownloadChain:
+            @staticmethod
+            def set_torrents_tag(**kwargs: Any) -> bool:
+                calls.append(kwargs)
+                return True
+
+        chain = types.ModuleType("app.chain")
+        chain_download = types.ModuleType("app.chain.download")
+        chain_download.DownloadChain = FakeDownloadChain
+        sys.modules.update({"app.chain": chain, "app.chain.download": chain_download})
+        task = self.module.ImportTask(
+            task_id="reserved-download",
+            download_hash="8" * 40,
+            downloader="QB",
+        )
+        self.assertTrue(self.module.PigGoKidsMetadata._reserve_download_for_plugin(task))
+        self.assertEqual(calls, [{
+            "hashs": "8" * 40,
+            "tags": ["piggokids", "已整理"],
+            "downloader": "QB",
+        }])
+
     def test_existing_host_histories_receive_artwork(self) -> None:
         class FakeHistory:
             def __init__(self, *, poster: str = "", image: str = "") -> None:
@@ -317,6 +357,55 @@ class V2PluginContractTest(unittest.TestCase):
             self.assertEqual(approved["data"]["task"]["state"], "READY_TO_TRANSFER")
             self.assertEqual(approved["data"]["decision"]["review"]["action"], "approve")
             self.assertFalse(plugin.api_review_task({"task_id": task_id, "action": "approve"})["success"])
+
+    def test_plugin_owned_conflict_is_locally_identified_and_auto_transferred(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "Mixed"
+            payload.mkdir()
+            (payload / "Mixed.mkv").write_bytes(b"")
+            (payload / "movie.nfo").write_text(
+                "<movie><title>插件自动识别</title><year>2024</year></movie>",
+                encoding="utf-8",
+            )
+            (payload / "tvshow.nfo").write_text(
+                "<tvshow><title>插件自动识别</title><year>2024</year></tvshow>",
+                encoding="utf-8",
+            )
+            plugin = self.module.PigGoKidsMetadata()
+            plugin.init_plugin({
+                "enabled": True,
+                "scan_root": str(root),
+                "auto_transfer": False,
+                "public_match_enabled": True,
+            })
+            imported = plugin.api_import_candidate({
+                "download_reference": "magnet:?xt=urn:btih:" + "6" * 40,
+                "title": "插件自动识别",
+                "media_type": "tv",
+            })
+            candidate_id = imported["data"]["candidate"]["candidate_id"]
+            plugin._submit_download_to_host = lambda *_: "6" * 40
+            submitted = plugin.api_download_candidate({"candidate_id": candidate_id})
+            task = plugin._find_task(submitted["data"]["task"]["task_id"])
+            task.relative_source_path = "Mixed"
+            plugin._save_task(task)
+            plugin._apply_public_match = lambda *_: self.fail("插件下载不应调用 MP 公共识别")
+            transfers = []
+
+            def start_transfer(current: Any, _: dict[str, Any]) -> tuple[bool, str]:
+                transfers.append(current.task_id)
+                current.transition(self.module.TaskState.TRANSFERRING, "test_auto_transfer")
+                plugin._save_task(current)
+                return True, "MoviePilot 已接受整理任务"
+
+            plugin._start_host_transfer = start_transfer
+            success, decision, message = plugin._scan_task(task, reason="download_poll_completed")
+            self.assertTrue(success)
+            self.assertTrue(decision["auto_eligible"])
+            self.assertEqual(message, "插件已自动识别并提交整理")
+            self.assertEqual(transfers, [task.task_id])
+            self.assertEqual(plugin._find_task(task.task_id).state, self.module.TaskState.TRANSFERRING)
 
     def test_exact_tmdb_match_reuses_public_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -642,10 +731,21 @@ class V2PluginContractTest(unittest.TestCase):
             chain_download = types.ModuleType("app.chain.download")
             chain_download.DownloadChain = FakeDownloadChain
             sys.modules.update({"app.chain": chain, "app.chain.download": chain_download})
+            transfers = []
+
+            def start_transfer(task: Any, _: dict[str, Any]) -> tuple[bool, str]:
+                transfers.append(task.task_id)
+                task.transition(self.module.TaskState.TRANSFERRING, "test_auto_transfer")
+                plugin._save_task(task)
+                return True, ""
+
+            plugin._start_host_transfer = start_transfer
             result = plugin.reconcile_downloads()
             self.assertTrue(result["success"])
             self.assertEqual(calls[0]["hashs"], ["2" * 40])
-            self.assertEqual(plugin.api_tasks()["data"]["items"][0]["state"], "READY_TO_TRANSFER")
+            self.assertTrue(calls[0]["include_all_tags"])
+            self.assertEqual(transfers, [plugin.api_tasks()["data"]["items"][0]["task_id"]])
+            self.assertEqual(plugin.api_tasks()["data"]["items"][0]["state"], "TRANSFERRING")
 
     def test_download_completion_supports_host_state_and_both_progress_scales(self) -> None:
         completed = self.module.PigGoKidsMetadata._torrent_completed
@@ -705,12 +805,22 @@ class V2PluginContractTest(unittest.TestCase):
                 "app.db": app_db,
                 "app.db.downloadhistory_oper": history_oper,
             })
+            transfers = []
+
+            def start_transfer(task: Any, _: dict[str, Any]) -> tuple[bool, str]:
+                transfers.append(task.task_id)
+                task.transition(self.module.TaskState.TRANSFERRING, "test_auto_transfer")
+                plugin._save_task(task)
+                return True, ""
+
+            plugin._start_host_transfer = start_transfer
             result = plugin.reconcile_downloads()
             self.assertTrue(result["success"])
             self.assertEqual(history_calls, [["3" * 40]])
             self.assertEqual(result["data"]["history_recovered"], 1)
             task = plugin.api_tasks()["data"]["items"][0]
-            self.assertEqual(task["state"], "READY_TO_TRANSFER")
+            self.assertEqual(transfers, [task["task_id"]])
+            self.assertEqual(task["state"], "TRANSFERRING")
             self.assertEqual(task["relative_source_path"], "CompletedMovie")
             self.assertEqual(task["downloader"], "fake-downloader")
             self.assertIn(

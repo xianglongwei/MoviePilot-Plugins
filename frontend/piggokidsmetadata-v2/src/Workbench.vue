@@ -4,7 +4,7 @@
       <div>
         <div class="text-h5 font-weight-bold">PigGo 儿童内容工作台</div>
         <div class="text-body-2 text-medium-emphasis">
-          候选发现、下载跟踪、本地识别和冲突审核
+          候选发现、下载跟踪和本地自动识别整理
         </div>
       </div>
       <VSpacer />
@@ -214,6 +214,19 @@
             xl="4"
           >
             <VCard variant="outlined" height="100%">
+              <VImg
+                v-if="candidate.poster_url"
+                :src="candidate.poster_url"
+                height="210"
+                cover
+                class="candidate-poster"
+              >
+                <template #placeholder>
+                  <div class="candidate-poster-placeholder">
+                    <VProgressCircular indeterminate color="primary" />
+                  </div>
+                </template>
+              </VImg>
               <VCardTitle class="candidate-title">{{
                 candidate.title
               }}</VCardTitle>
@@ -1039,6 +1052,16 @@ onMounted(loadAll);
 .candidate-title {
   white-space: normal;
   line-height: 1.4;
+}
+.candidate-poster {
+  border-bottom: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+  background: rgb(var(--v-theme-surface-variant));
+}
+.candidate-poster-placeholder {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .candidate-summary {
   display: -webkit-box;

@@ -64,7 +64,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.6.1"
+    plugin_version = "0.7.0"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -337,7 +337,9 @@ class PigGoKidsMetadata(_PluginBase):
                         "component": "VSwitch",
                         "props": {
                             "model": "auto_transfer",
-                            "label": "高置信度识别后自动整理（谨慎开启）",
+                            "label": "手工扫描的高置信度任务自动整理",
+                            "hint": "插件提交的下载固定由插件本地识别并自动整理，不受此开关影响。",
+                            "persistentHint": True,
                         },
                     },
                     {
@@ -420,6 +422,16 @@ class PigGoKidsMetadata(_PluginBase):
             },
         ]
         for item in reversed(candidates[-20:]):
+            if poster_url := self._display_artwork_reference(item.candidate_id):
+                candidate_content.append({
+                    "component": "VImg",
+                    "props": {
+                        "src": poster_url,
+                        "height": 180,
+                        "cover": True,
+                        "class": "mx-4 mt-3 rounded",
+                    },
+                })
             candidate_content.append({
                 "component": "VCardText",
                 "text": f"{item.title}｜{item.media_type.value}｜{item.status.value}",
@@ -869,6 +881,28 @@ class PigGoKidsMetadata(_PluginBase):
         return None
 
     @staticmethod
+    def _reserve_download_for_plugin(task: ImportTask) -> bool:
+        """标记插件下载已由自身接管，阻止 MP 下载器监控再次自动识别整理。"""
+
+        download_hash = normalize_download_hash(task.download_hash)
+        if not download_hash:
+            return False
+        try:
+            from app.chain.download import DownloadChain
+
+            result = DownloadChain().set_torrents_tag(
+                hashs=download_hash,
+                tags=["piggokids", "已整理"],
+                downloader=task.downloader,
+            )
+            return bool(result)
+        except (ImportError, AttributeError):
+            return False
+        except Exception:
+            logger.error("PigGoKidsMetadata V2 下载接管标记失败：unexpected_error")
+            return False
+
+    @staticmethod
     def _backfill_host_history_artwork(task: ImportTask, artwork_url: Optional[str]) -> int:
         """为既有 MP 下载/整理历史补齐封面字段，不覆盖已有图片。"""
 
@@ -1073,6 +1107,7 @@ class PigGoKidsMetadata(_PluginBase):
                 task.transition(TaskState.DOWNLOADING, "host_tracking")
             task.last_error_code = None
             self._save_task(task)
+            self._reserve_download_for_plugin(task)
             self._update_candidate(candidate.candidate_id, status=CandidateStatus.DOWNLOADING, task_id=task.task_id)
             return True, task, "下载任务已提交"
         except PigGoCoreError as error:
@@ -1272,7 +1307,18 @@ class PigGoKidsMetadata(_PluginBase):
                 minimum_confidence=self._minimum_confidence,
                 policy=ScanPolicy(max_files=self._max_files),
             )
-            self._apply_public_match(decision)
+            plugin_owned = bool(task.candidate_id)
+            # 插件提交的下载完全采用本地 NFO/文件名身份；不再交给 MP/TMDb
+            # 二次识别，也不因置信度阈值或冲突停在人工审核。
+            if plugin_owned and (
+                not decision.item
+                or decision.item.media_type not in {MediaKind.MOVIE, MediaKind.TV}
+            ):
+                raise PigGoCoreError("插件无法从本地元数据确定电影或剧集类型")
+            if plugin_owned:
+                decision.auto_eligible = True
+            else:
+                self._apply_public_match(decision)
             if task.state == TaskState.SCANNING:
                 task.transition(TaskState.MATCHING, "payload_scanned")
             if decision.item:
@@ -1301,9 +1347,20 @@ class PigGoKidsMetadata(_PluginBase):
                 status=CandidateStatus.SELECTED,
                 task_id=task.task_id,
             )
-            if decision.auto_eligible and allow_auto_transfer and self._auto_transfer:
-                self._start_host_transfer(task, decision.to_dict())
-            return True, decision.to_dict(), "内容包识别完成"
+            message = "内容包识别完成"
+            if (
+                decision.auto_eligible
+                and allow_auto_transfer
+                and (plugin_owned or self._auto_transfer)
+            ):
+                transfer_success, transfer_message = self._start_host_transfer(
+                    task,
+                    decision.to_dict(),
+                )
+                if not transfer_success:
+                    return False, decision.to_dict(), transfer_message
+                message = "插件已自动识别并提交整理"
+            return True, decision.to_dict(), message
         except PigGoCoreError as error:
             if task.state not in {TaskState.RETRYABLE_FAILED, TaskState.NEEDS_REVIEW}:
                 try:
@@ -1456,6 +1513,7 @@ class PigGoKidsMetadata(_PluginBase):
         if task.state == TaskState.DOWNLOAD_SUBMITTED:
             task.transition(TaskState.DOWNLOADING, "download_added_event")
         self._save_task(task)
+        self._reserve_download_for_plugin(task)
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
@@ -1637,6 +1695,9 @@ class PigGoKidsMetadata(_PluginBase):
             for raw in self._load_tasks()
             if raw.get("state") not in {TaskState.COMPLETED.value, TaskState.IGNORED.value}
         ]
+        for task in tasks:
+            if task.candidate_id and task.download_hash:
+                self._reserve_download_for_plugin(task)
         hashes = sorted({
             value
             for value in (normalize_download_hash(task.download_hash) for task in tasks)
@@ -1647,13 +1708,20 @@ class PigGoKidsMetadata(_PluginBase):
 
             chain = DownloadChain()
             try:
-                torrents = (
-                    chain.list_torrents(
-                        downloader=self._downloader or None,
-                        hashs=hashes,
-                    )
-                    if hashes else []
-                ) or []
+                if hashes:
+                    try:
+                        torrents = chain.list_torrents(
+                            downloader=self._downloader or None,
+                            hashs=hashes,
+                            include_all_tags=True,
+                        ) or []
+                    except TypeError:
+                        torrents = chain.list_torrents(
+                            downloader=self._downloader or None,
+                            hashs=hashes,
+                        ) or []
+                else:
+                    torrents = []
             except (AttributeError, TypeError):
                 torrents = chain.downloading(self._downloader or None) or []
         except Exception:
@@ -1814,9 +1882,17 @@ class PigGoKidsMetadata(_PluginBase):
             safe_limit = max(1, min(500, int(limit or 100)))
         except (TypeError, ValueError):
             safe_limit = 100
+        candidates = self._load_candidates()
+        if (
+            candidates
+            and self._rss_urls
+            and not self._candidate_artwork_references
+        ):
+            self.refresh_candidates()
+            candidates = self._load_candidates()
         items = []
         total = 0
-        for item in reversed(self._load_candidates()):
+        for item in reversed(candidates):
             if normalized_query and normalized_query not in normalize_title(item.title):
                 continue
             if status_value and item.status.value != status_value:
@@ -1825,7 +1901,9 @@ class PigGoKidsMetadata(_PluginBase):
                 continue
             total += 1
             if len(items) < safe_limit:
-                items.append(item.to_dict())
+                values = item.to_dict()
+                values["poster_url"] = self._display_artwork_reference(item.candidate_id)
+                items.append(values)
         return self._response(True, {"items": items, "total": total})
 
     def api_refresh_candidates(self, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
