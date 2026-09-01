@@ -35,6 +35,15 @@
       </VCol>
       <VCol cols="12" md="6">
         <VTextField
+          v-model="config.artwork_public_base_url"
+          label="MoviePilot API 根地址"
+          placeholder="http://192.168.10.20:3001"
+          hint="用于本地封面显示，请填写浏览器可访问的 API 端口"
+          persistent-hint
+        />
+      </VCol>
+      <VCol cols="12" md="6">
+        <VTextField
           v-model="config.scan_root"
           label="扫描根目录"
           hint="MoviePilot 容器内可访问的下载根目录"
@@ -97,6 +106,7 @@ const defaults = {
   rss_urls: "",
   downloader: "",
   download_save_path: "",
+  artwork_public_base_url: "",
   scan_root: "",
   minimum_confidence: 0.8,
   max_files: 10000,

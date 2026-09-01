@@ -181,6 +181,48 @@ class V2PluginContractTest(unittest.TestCase):
             str(item.candidate.to_dict()),
         )
 
+    def test_manual_rss_refresh_caches_blocked_poster_in_persistent_data_dir(self) -> None:
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
+        xml = f"""<rss><channel><item>
+          <title>封面缓存样例</title>
+          <link>https://piggo.example/details.php?id=654</link>
+          <enclosure url="https://piggo.example/download.php?id=654" />
+          <description><![CDATA[
+            <img src="https://m.ykimg.com/poster.jpg?token={secret}" />
+            <img src="https://origin.piggo.me/poster/654.jpg" />
+          ]]></description>
+        </item></channel></rss>"""
+        with tempfile.TemporaryDirectory() as temporary:
+            plugin = self.module.PigGoKidsMetadata()
+            plugin.init_plugin({
+                "enabled": True,
+                "rss_urls": "https://piggo.example/rss.php",
+                "artwork_public_base_url": "http://192.168.10.20:3001",
+            })
+            data_path = Path(temporary) / "plugin-data"
+            plugin.get_data_path = lambda: data_path
+            plugin._fetch_feed_content = lambda _: (xml.encode("utf-8"), 200)
+            plugin._fetch_artwork_content = lambda _: (b"\xff\xd8\xffposter", ".jpg")
+
+            with (
+                mock.patch.object(self.module.time, "sleep"),
+                mock.patch.object(
+                    plugin,
+                    "_static_artwork_dir",
+                    return_value=Path(temporary) / "static-artwork",
+                ),
+            ):
+                response = plugin.api_refresh_candidates({})
+
+            self.assertTrue(response["success"])
+            self.assertEqual(response["data"]["artwork_cached"], 1)
+            candidate = plugin.api_candidates()["data"]["items"][0]
+            self.assertTrue(candidate["poster_url"].startswith(
+                "http://192.168.10.20:3001/api/v1/plugin/file/"
+            ))
+            self.assertEqual(len(list((data_path / "artwork").glob("candidate-*.jpg"))), 1)
+            self.assertNotIn(secret, json.dumps(plugin._plugin_data, ensure_ascii=False))
+
     def test_only_credential_free_https_artwork_is_shared_with_host(self) -> None:
         plugin = self.module.PigGoKidsMetadata()
         plugin.init_plugin({"enabled": True})

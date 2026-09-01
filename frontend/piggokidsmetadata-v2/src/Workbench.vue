@@ -830,7 +830,9 @@ async function refreshRss() {
   if (!window.confirm("确认现在访问站点并刷新一次 RSS？插件不会自动刷新。")) return;
   await runAction(
     "rss",
-    () => client.post("/candidates/refresh"),
+    () => client.post("/candidates/refresh", {
+      public_base_url: status.value.artwork_public_base_url || "",
+    }),
     "RSS 候选已刷新",
   );
 }

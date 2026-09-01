@@ -6,8 +6,10 @@ import hashlib
 import base64
 import binascii
 import os
+import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, urljoin, urlsplit
@@ -59,6 +61,8 @@ FEED_STATUS_KEY = "feed_status_v1"
 MAX_REGISTRY_ITEMS = 500
 MAX_CANDIDATE_ITEMS = 1_000
 MAX_ARTWORK_BYTES = 8 * 1024 * 1024
+MAX_ARTWORK_CACHE_PER_REFRESH = 25
+ARTWORK_FETCH_INTERVAL_SECONDS = 0.5
 DOWNLOAD_SOURCE = "PigGoKidsMetadata"
 
 
@@ -68,7 +72,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.8"
+    plugin_version = "0.7.9"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -82,6 +86,7 @@ class PigGoKidsMetadata(_PluginBase):
     _rss_urls: list[str] = []
     _downloader = ""
     _download_save_path = ""
+    _artwork_public_base_url = ""
     _auto_transfer = False
     _public_match_enabled = True
     _config_error: Optional[str] = None
@@ -94,9 +99,16 @@ class PigGoKidsMetadata(_PluginBase):
         self._scan_root = str(values.get("scan_root") or "").strip()
         self._downloader = str(values.get("downloader") or "").strip()
         self._download_save_path = str(values.get("download_save_path") or "").strip()
+        self._config_error = None
+        try:
+            self._artwork_public_base_url = self._normalize_public_base_url(
+                values.get("artwork_public_base_url")
+            )
+        except PigGoCoreError:
+            self._artwork_public_base_url = ""
+            self._config_error = "invalid_artwork_public_base_url"
         self._auto_transfer = bool(values.get("auto_transfer", False))
         self._public_match_enabled = bool(values.get("public_match_enabled", True))
-        self._config_error = None
         self._state_lock = threading.RLock()
         self._submission_lock = threading.RLock()
         self._candidate_download_references: dict[str, str] = {}
@@ -121,6 +133,7 @@ class PigGoKidsMetadata(_PluginBase):
             self._max_files = 10_000
         self._repair_placeholder_download_titles()
         self._restore_uploaded_artwork_cache()
+        self._restore_persistent_candidate_artwork_cache()
 
     def get_state(self) -> bool:
         return self._enabled
@@ -345,6 +358,16 @@ class PigGoKidsMetadata(_PluginBase):
                         },
                     },
                     {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "artwork_public_base_url",
+                            "label": "MoviePilot API 根地址（用于本地封面）",
+                            "placeholder": "http://192.168.10.20:3001",
+                            "hint": "填写浏览器可访问的 API 端口；仅手工刷新 RSS 时缓存缺失封面。",
+                            "persistentHint": True,
+                        },
+                    },
+                    {
                         "component": "VSwitch",
                         "props": {
                             "model": "auto_transfer",
@@ -398,6 +421,7 @@ class PigGoKidsMetadata(_PluginBase):
             "rss_urls": "",
             "downloader": "",
             "download_save_path": "",
+            "artwork_public_base_url": "",
             "auto_transfer": False,
             "public_match_enabled": True,
             "scan_root": "",
@@ -946,6 +970,15 @@ class PigGoKidsMetadata(_PluginBase):
             return False, None, "整理目标目录不存在"
         if existing := self._existing_poster(directory):
             return True, existing, "目标目录已有封面"
+        if task.candidate_id:
+            try:
+                cached = self._read_cached_candidate_artwork(task.candidate_id)
+                if cached:
+                    content, extension = cached
+                    target = self._write_artwork(directory, content, extension)
+                    return True, target, "已从本地封面缓存写入媒体目录"
+            except OSError:
+                pass
         self._restore_candidate_artwork_references(task.candidate_id)
         references = self._candidate_artwork_references.get(str(task.candidate_id or ""), ())
         if not references:
@@ -1035,15 +1068,44 @@ class PigGoKidsMetadata(_PluginBase):
         digest = hashlib.sha256(task.task_id.encode("utf-8")).hexdigest()[:32]
         return f"{digest}{extension}"
 
-    @classmethod
-    def _cache_task_artwork(cls, task: ImportTask, content: bytes, extension: str) -> Path:
-        directory = Path(__file__).resolve().parent / "user-artwork"
+    @staticmethod
+    def _normalize_public_base_url(value: Any) -> str:
+        base = str(value or "").strip().rstrip("/")
+        if not base:
+            return ""
+        try:
+            parts = urlsplit(base)
+        except ValueError as error:
+            raise PigGoCoreError("MoviePilot API 地址格式无效") from error
+        if (
+            parts.scheme.casefold() not in {"http", "https"}
+            or not parts.hostname
+            or parts.username
+            or parts.password
+            or parts.query
+            or parts.fragment
+            or parts.path not in {"", "/"}
+        ):
+            raise PigGoCoreError("MoviePilot API 地址必须是 HTTP(S) 站点根地址")
+        return base
+
+    @staticmethod
+    def _candidate_artwork_cache_name(candidate_id: str, extension: str) -> str:
+        digest = hashlib.sha256(candidate_id.encode("utf-8")).hexdigest()[:32]
+        return f"candidate-{digest}{extension}"
+
+    @staticmethod
+    def _static_artwork_dir() -> Path:
+        return Path(__file__).resolve().parent / "user-artwork"
+
+    @staticmethod
+    def _atomic_write_artwork(directory: Path, name: str, content: bytes) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
-        target = directory / cls._task_artwork_cache_name(task, extension)
+        target = directory / name
         temporary_name: Optional[str] = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="wb", prefix=".upload-", suffix=".tmp", dir=directory, delete=False
+                mode="wb", prefix=".artwork-", suffix=".tmp", dir=directory, delete=False
             ) as handle:
                 temporary_name = handle.name
                 handle.write(content)
@@ -1059,6 +1121,118 @@ class PigGoKidsMetadata(_PluginBase):
                 except OSError:
                     pass
 
+    def _persistent_artwork_dir(self) -> Optional[Path]:
+        """返回 MoviePilot 专用插件数据目录；轻量测试环境没有此能力。"""
+
+        getter = getattr(self, "get_data_path", None)
+        if not callable(getter):
+            return None
+        try:
+            return Path(getter()) / "artwork"
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def _candidate_artwork_public_url(
+        self,
+        candidate_id: str,
+        extension: str,
+        public_base_url: str = "",
+    ) -> str:
+        name = self._candidate_artwork_cache_name(candidate_id, extension)
+        path = f"/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/{name}"
+        base = self._normalize_public_base_url(
+            public_base_url or self._artwork_public_base_url
+        )
+        return f"{base}{path}" if base else path
+
+    def _cache_candidate_artwork(
+        self,
+        candidate_id: str,
+        content: bytes,
+        extension: str,
+    ) -> Optional[Path]:
+        persistent_dir = self._persistent_artwork_dir()
+        if persistent_dir is None:
+            return None
+        name = self._candidate_artwork_cache_name(candidate_id, extension)
+        persistent = self._atomic_write_artwork(persistent_dir, name, content)
+        self._atomic_write_artwork(self._static_artwork_dir(), name, content)
+        return persistent
+
+    def _restore_cached_candidate_artwork(
+        self,
+        candidate_id: str,
+        public_base_url: str = "",
+    ) -> Optional[str]:
+        persistent_dir = self._persistent_artwork_dir()
+        if persistent_dir is None:
+            return None
+        for extension in (".jpg", ".png", ".webp"):
+            name = self._candidate_artwork_cache_name(candidate_id, extension)
+            source = persistent_dir / name
+            if not source.is_file():
+                continue
+            target = self._static_artwork_dir() / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.is_file() or target.stat().st_size != source.stat().st_size:
+                shutil.copyfile(source, target)
+            return self._candidate_artwork_public_url(
+                candidate_id,
+                extension,
+                public_base_url,
+            )
+        return None
+
+    def _read_cached_candidate_artwork(
+        self,
+        candidate_id: str,
+    ) -> Optional[tuple[bytes, str]]:
+        persistent_dir = self._persistent_artwork_dir()
+        if persistent_dir is None:
+            return None
+        for extension in (".jpg", ".png", ".webp"):
+            source = persistent_dir / self._candidate_artwork_cache_name(
+                candidate_id,
+                extension,
+            )
+            if not source.is_file() or source.stat().st_size > MAX_ARTWORK_BYTES:
+                continue
+            content = source.read_bytes()
+            if content:
+                return content, extension
+        return None
+
+    def _restore_persistent_candidate_artwork_cache(self) -> int:
+        """插件升级后从持久目录恢复候选封面，过程中不访问网络。"""
+
+        candidates = self._load_candidates()
+        restored = 0
+        changed = False
+        for candidate in candidates:
+            try:
+                artwork_url = self._restore_cached_candidate_artwork(candidate.candidate_id)
+            except OSError:
+                continue
+            if not artwork_url:
+                continue
+            self._candidate_artwork_references[candidate.candidate_id] = (artwork_url,)
+            if candidate.poster_url != artwork_url:
+                candidate.poster_url = artwork_url
+                candidate.updated_at = utc_now()
+                changed = True
+            restored += 1
+        if changed:
+            self._save_candidates(candidates)
+        return restored
+
+    @classmethod
+    def _cache_task_artwork(cls, task: ImportTask, content: bytes, extension: str) -> Path:
+        return cls._atomic_write_artwork(
+            cls._static_artwork_dir(),
+            cls._task_artwork_cache_name(task, extension),
+            content,
+        )
+
     @classmethod
     def _task_artwork_public_url(
         cls,
@@ -1068,23 +1242,9 @@ class PigGoKidsMetadata(_PluginBase):
     ) -> str:
         name = cls._task_artwork_cache_name(task, extension)
         path = f"/api/v1/plugin/file/PigGoKidsMetadata/user-artwork/{name}"
-        base = str(public_base_url or "").strip().rstrip("/")
+        base = cls._normalize_public_base_url(public_base_url)
         if not base:
             return path
-        try:
-            parts = urlsplit(base)
-        except ValueError as error:
-            raise PigGoCoreError("MoviePilot API 地址格式无效") from error
-        if (
-            parts.scheme.casefold() not in {"http", "https"}
-            or not parts.hostname
-            or parts.username
-            or parts.password
-            or parts.query
-            or parts.fragment
-            or parts.path not in {"", "/"}
-        ):
-            raise PigGoCoreError("MoviePilot API 地址必须是 HTTP(S) 站点根地址")
         return f"{base}{path}"
 
     def _set_candidate_uploaded_artwork(self, task: ImportTask, artwork_url: str) -> None:
@@ -1231,13 +1391,51 @@ class PigGoKidsMetadata(_PluginBase):
             logger.error("PigGoKidsMetadata V2 历史封面回填失败：unexpected_error")
             return 0
 
-    def refresh_candidates(self) -> dict[str, Any]:
+    @staticmethod
+    def _requires_local_artwork_cache(candidate: FeedCandidate) -> bool:
+        try:
+            hostname = (urlsplit(str(candidate.poster_url or "")).hostname or "").casefold()
+        except ValueError:
+            return False
+        return hostname == "origin.piggo.me"
+
+    @staticmethod
+    def _cacheable_artwork_references(references: tuple[str, ...]) -> tuple[str, ...]:
+        result: list[str] = []
+        for reference in references:
+            if "***" in reference:
+                continue
+            try:
+                parts = urlsplit(reference)
+            except ValueError:
+                continue
+            if (parts.hostname or "").casefold() == "origin.piggo.me":
+                continue
+            if parts.scheme.casefold() not in {"http", "https"} or not parts.hostname:
+                continue
+            result.append(reference)
+        return tuple(dict.fromkeys(result))
+
+    def refresh_candidates(self, public_base_url: str = "") -> dict[str, Any]:
+        """仅响应用户显式操作刷新 RSS，并顺带缓存被拦截的候选封面。"""
+
         if not self._enabled:
             return self._response(False, message="插件尚未启用")
+        try:
+            artwork_base = self._normalize_public_base_url(
+                public_base_url or self._artwork_public_base_url
+            )
+        except PigGoCoreError as error:
+            return self._response(False, message=str(error))
         statuses = self._load_feed_status()
         incoming: list[FeedCandidate] = []
         parsed_count = 0
         successful = 0
+        artwork_cached = 0
+        artwork_cache_hits = 0
+        artwork_cache_failed = 0
+        artwork_cache_attempted = 0
+        last_artwork_fetch_at = 0.0
         for url in self._rss_urls:
             feed_id = feed_id_for_url(url)
             from .core import redact_url
@@ -1256,7 +1454,59 @@ class PigGoKidsMetadata(_PluginBase):
                 parsed = parse_feed_document(content, source_feed_id=feed_id)
                 for item in parsed:
                     self._candidate_download_references[item.candidate.candidate_id] = item.download_reference
-                    self._candidate_artwork_references[item.candidate.candidate_id] = item.artwork_references
+                    candidate_id = item.candidate.candidate_id
+                    cached_url = self._restore_cached_candidate_artwork(
+                        candidate_id,
+                        artwork_base,
+                    )
+                    if cached_url:
+                        item.candidate.poster_url = cached_url
+                        self._candidate_artwork_references[candidate_id] = (cached_url,)
+                        artwork_cache_hits += 1
+                    elif (
+                        self._requires_local_artwork_cache(item.candidate)
+                        and artwork_cache_attempted < MAX_ARTWORK_CACHE_PER_REFRESH
+                    ):
+                        artwork_cache_attempted += 1
+                        cached = False
+                        references = self._cacheable_artwork_references(item.artwork_references)
+                        for reference in references[:2]:
+                            wait_seconds = ARTWORK_FETCH_INTERVAL_SECONDS - (
+                                time.monotonic() - last_artwork_fetch_at
+                            )
+                            if wait_seconds > 0:
+                                time.sleep(wait_seconds)
+                            last_artwork_fetch_at = time.monotonic()
+                            try:
+                                image_content, extension = self._fetch_artwork_content(reference)
+                                stored = self._cache_candidate_artwork(
+                                    candidate_id,
+                                    image_content,
+                                    extension,
+                                )
+                                if not stored:
+                                    break
+                                cached_url = self._candidate_artwork_public_url(
+                                    candidate_id,
+                                    extension,
+                                    artwork_base,
+                                )
+                                item.candidate.poster_url = cached_url
+                                self._candidate_artwork_references[candidate_id] = (cached_url,)
+                                artwork_cached += 1
+                                cached = True
+                                break
+                            except (InvalidReferenceError, PigGoCoreError, OSError):
+                                continue
+                            except Exception:
+                                logger.error(
+                                    "PigGoKidsMetadata V2 候选封面缓存失败：unexpected_error"
+                                )
+                        if not cached:
+                            self._candidate_artwork_references[candidate_id] = item.artwork_references
+                            artwork_cache_failed += 1
+                    else:
+                        self._candidate_artwork_references[candidate_id] = item.artwork_references
                     incoming.append(item.candidate)
                 status.update({
                     "last_success_at": utc_now(),
@@ -1281,6 +1531,10 @@ class PigGoKidsMetadata(_PluginBase):
                 "successful_feeds": successful,
                 "parsed_count": parsed_count,
                 "candidate_count": len(merged),
+                "artwork_cached": artwork_cached,
+                "artwork_cache_hits": artwork_cache_hits,
+                "artwork_cache_failed": artwork_cache_failed,
+                "artwork_cache_attempted": artwork_cache_attempted,
             },
             "" if successful > 0 else ("尚未配置 RSS" if not self._rss_urls else "RSS 刷新失败"),
         )
@@ -2132,6 +2386,7 @@ class PigGoKidsMetadata(_PluginBase):
             "rss_feed_count": len(self._rss_urls),
             "rss_configured": bool(self._rss_urls),
             "rss_refresh_mode": "manual_only",
+            "artwork_public_base_url": self._artwork_public_base_url,
             "downloader_configured": bool(self._downloader),
             "download_save_path_configured": bool(self._download_save_path),
             "auto_transfer": self._auto_transfer,
@@ -2215,8 +2470,10 @@ class PigGoKidsMetadata(_PluginBase):
         return self._response(True, {"items": items, "total": total})
 
     def api_refresh_candidates(self, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-        del payload
-        return self.refresh_candidates()
+        values = dict(payload or {})
+        return self.refresh_candidates(
+            public_base_url=str(values.get("public_base_url") or "").strip()
+        )
 
     def api_task_artwork(self, payload: dict[str, Any]) -> dict[str, Any]:
         """根据整理历史定位媒体根目录，并为一个任务补写 RSS 封面。"""
