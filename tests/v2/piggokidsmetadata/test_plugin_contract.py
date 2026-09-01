@@ -209,6 +209,59 @@ class V2PluginContractTest(unittest.TestCase):
         candidate = plugin.api_candidates()["data"]["items"][0]
         self.assertEqual(candidate["poster_url"], "https://images.example.test/poster.jpg")
 
+    def test_manual_link_reuses_cached_rss_metadata_without_refresh(self) -> None:
+        feeds = sys.modules[f"{self.module.__name__}.feeds"]
+        xml = """<rss><channel><item>
+          <title>百科探秘 AI 少年 S01</title>
+          <link>https://piggo.example/details.php?id=321</link>
+          <enclosure url="https://piggo.example/download.php?id=321&amp;passkey=old" />
+          <description><![CDATA[
+            <img src="https://images.example.test/posters/ai-kids.jpg" />
+          ]]></description>
+        </item></channel></rss>"""
+        cached = feeds.parse_feed_document(xml, source_feed_id="feed:cached")[0].candidate
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True, "rss_urls": "https://piggo.example/rss.php"})
+        plugin._save_candidates([cached])
+        with mock.patch.object(plugin, "refresh_candidates", side_effect=AssertionError("RSS refreshed")):
+            imported = plugin.api_import_candidate({
+                "download_reference": "https://piggo.example/download.php?id=321&passkey=new",
+            })
+            listed = plugin.api_candidates()
+        self.assertTrue(imported["success"])
+        self.assertEqual(imported["data"]["candidate"]["title"], "百科探秘 AI 少年 S01")
+        self.assertEqual(
+            listed["data"]["items"][0]["poster_url"],
+            "https://images.example.test/posters/ai-kids.jpg",
+        )
+
+    def test_manual_link_accepts_only_safe_public_poster(self) -> None:
+        plugin = self.module.PigGoKidsMetadata()
+        plugin.init_plugin({"enabled": True})
+        accepted = plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "6" * 40,
+            "poster_url": "https://images.example.test/poster.jpg",
+        })
+        rejected = plugin.api_import_candidate({
+            "download_reference": "magnet:?xt=urn:btih:" + "5" * 40,
+            "poster_url": "https://images.example.test/poster.jpg?token=secret",
+        })
+        self.assertTrue(accepted["success"])
+        self.assertFalse(rejected["success"])
+        self.assertEqual(
+            accepted["data"]["candidate"]["poster_url"],
+            "https://images.example.test/poster.jpg",
+        )
+
+    def test_download_label_includes_moviepilot_system_tag(self) -> None:
+        config = types.ModuleType("app.core.config")
+        config.settings = types.SimpleNamespace(TORRENT_TAG="MOVIEPILOT")
+        with mock.patch.dict(sys.modules, {"app.core.config": config}):
+            self.assertEqual(
+                self.module.PigGoKidsMetadata._host_download_label(),
+                "piggokids,MOVIEPILOT",
+            )
+
     def test_plugin_download_is_reserved_from_host_auto_transfer(self) -> None:
         calls = []
 

@@ -99,6 +99,14 @@
                   "
                 />
               </VCol>
+              <VCol cols="12">
+                <VTextField
+                  v-model="importForm.poster_url"
+                  label="封面 HTTPS 地址（可选）"
+                  hint="优先匹配已有 RSS 缓存；匹配不到时可填写公开封面地址，不会刷新 RSS"
+                  persistent-hint
+                />
+              </VCol>
             </VRow>
             <div class="d-flex flex-wrap justify-end ga-2 mt-2">
               <VBtn
@@ -680,6 +688,7 @@ const importForm = reactive({
   title: "",
   media_type: "unknown",
   download_reference: "",
+  poster_url: "",
 });
 const scanForm = reactive({
   relative_path: "",
@@ -812,6 +821,7 @@ async function runAction(key, action, successMessage) {
 }
 
 async function refreshRss() {
+  if (!window.confirm("确认现在访问站点并刷新一次 RSS？插件不会自动刷新。")) return;
   await runAction(
     "rss",
     () => client.post("/candidates/refresh"),
@@ -835,6 +845,7 @@ async function importReference(downloadNow) {
       }
       importForm.download_reference = "";
       importForm.title = "";
+      importForm.poster_url = "";
     },
     downloadNow ? "已提交到 MoviePilot 下载器" : "已加入候选列表",
   );

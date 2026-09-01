@@ -258,6 +258,7 @@ class FeedCandidate:
     size_bytes: Optional[int] = None
     detail_url: Optional[str] = None
     download_url: Optional[str] = None
+    poster_url: Optional[str] = None
     task_id: Optional[str] = None
     title_overridden: bool = False
     media_type_overridden: bool = False
@@ -294,7 +295,7 @@ class ParsedCandidate:
     artwork_references: tuple[str, ...] = field(default_factory=tuple, repr=False)
 
 
-def _extract_artwork_references(description: str, *, maximum: int = 4) -> tuple[str, ...]:
+def extract_artwork_references(description: str, *, maximum: int = 4) -> tuple[str, ...]:
     """从 RSS HTML 摘要提取瞬态公网图片 URL，不在解析阶段触发 DNS。"""
 
     references: list[str] = []
@@ -319,6 +320,37 @@ def _extract_artwork_references(description: str, *, maximum: int = 4) -> tuple[
         if len(references) >= max(1, min(10, int(maximum))):
             break
     return tuple(references)
+
+
+def safe_persisted_artwork_reference(references: Iterable[str]) -> Optional[str]:
+    """只持久化可公开展示、无凭据且无查询参数的 HTTPS 图片地址。"""
+
+    for reference in references:
+        if "***" in str(reference or ""):
+            continue
+        try:
+            parts = urlsplit(str(reference or "").strip())
+        except ValueError:
+            continue
+        if (
+            parts.scheme.casefold() == "https"
+            and parts.hostname
+            and not parts.username
+            and not parts.password
+            and not parts.query
+            and not parts.fragment
+            and len(str(reference)) <= MAX_REFERENCE_LENGTH
+        ):
+            hostname = str(parts.hostname).casefold().rstrip(".")
+            if hostname == "localhost" or hostname.endswith(".localhost"):
+                continue
+            try:
+                if not ipaddress.ip_address(hostname).is_global:
+                    continue
+            except ValueError:
+                pass
+            return str(reference).strip()
+    return None
 
 
 def _entry_links(entry: ET.Element) -> tuple[str, str, Optional[int]]:
@@ -413,11 +445,14 @@ def parse_feed_document(
             size_bytes=size,
             detail_url=redact_url(detail) if detail else None,
             download_url=redact_url(download),
+            poster_url=safe_persisted_artwork_reference(
+                extract_artwork_references(description)
+            ),
         )
         results.append(ParsedCandidate(
             candidate=candidate,
             download_reference=download,
-            artwork_references=_extract_artwork_references(description),
+            artwork_references=extract_artwork_references(description),
         ))
     return results
 

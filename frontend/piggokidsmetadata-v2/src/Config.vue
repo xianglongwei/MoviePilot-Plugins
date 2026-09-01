@@ -17,16 +17,10 @@
       auto-grow
       @click:append-inner="showRssUrls = !showRssUrls"
     />
+    <VAlert type="warning" variant="tonal" class="mt-3">
+      不会定时或隐式刷新 RSS；只有你在工作台主动点击“刷新 RSS”时才会访问站点。
+    </VAlert>
     <VRow class="mt-1">
-      <VCol cols="12" md="6">
-        <VTextField
-          v-model.number="config.rss_interval_minutes"
-          label="RSS 刷新间隔（分钟）"
-          type="number"
-          min="10"
-          max="1440"
-        />
-      </VCol>
       <VCol cols="12" md="6">
         <VTextField
           v-model="config.downloader"
@@ -101,7 +95,6 @@ const showRssUrls = ref(false);
 const defaults = {
   enabled: false,
   rss_urls: "",
-  rss_interval_minutes: 30,
   downloader: "",
   download_save_path: "",
   scan_root: "",

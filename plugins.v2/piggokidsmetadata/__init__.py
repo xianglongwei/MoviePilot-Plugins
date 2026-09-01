@@ -36,10 +36,12 @@ from .feeds import (
     FeedCandidate,
     InvalidReferenceError,
     candidate_from_reference,
+    extract_artwork_references,
     feed_id_for_url,
     parse_feed_document,
     parse_feed_urls_config,
     reference_fingerprint,
+    safe_persisted_artwork_reference,
     upsert_candidates,
     utc_now,
     validate_download_reference,
@@ -64,7 +66,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.7.1"
+    plugin_version = "0.7.2"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -76,7 +78,6 @@ class PigGoKidsMetadata(_PluginBase):
     _minimum_confidence = 0.80
     _max_files = 10_000
     _rss_urls: list[str] = []
-    _rss_interval_minutes = 30
     _downloader = ""
     _download_save_path = ""
     _auto_transfer = False
@@ -105,12 +106,6 @@ class PigGoKidsMetadata(_PluginBase):
             self._rss_urls = []
             self._config_error = "invalid_rss_url"
             logger.error("PigGoKidsMetadata V2 RSS 配置无效：invalid_rss_url")
-        try:
-            self._rss_interval_minutes = max(
-                10, min(1_440, int(values.get("rss_interval_minutes", 30)))
-            )
-        except (TypeError, ValueError):
-            self._rss_interval_minutes = 30
         try:
             self._minimum_confidence = max(
                 0.0,
@@ -310,13 +305,11 @@ class PigGoKidsMetadata(_PluginBase):
                         },
                     },
                     {
-                        "component": "VTextField",
+                        "component": "VAlert",
                         "props": {
-                            "model": "rss_interval_minutes",
-                            "label": "RSS 刷新间隔（分钟）",
-                            "type": "number",
-                            "min": 10,
-                            "max": 1440,
+                            "type": "warning",
+                            "variant": "tonal",
+                            "text": "插件不会定时或隐式刷新 RSS；只有在工作台主动点击“刷新 RSS”才会访问站点。",
                         },
                     },
                     {
@@ -385,7 +378,6 @@ class PigGoKidsMetadata(_PluginBase):
         ], {
             "enabled": False,
             "rss_urls": "",
-            "rss_interval_minutes": 30,
             "downloader": "",
             "download_save_path": "",
             "auto_transfer": False,
@@ -511,22 +503,13 @@ class PigGoKidsMetadata(_PluginBase):
             return []
         from apscheduler.triggers.interval import IntervalTrigger
 
-        services = [{
+        return [{
             "id": "PigGoKidsMetadata.DownloadTracking",
             "name": "PigGo 儿童下载状态恢复",
             "trigger": IntervalTrigger(minutes=5),
             "func": self.reconcile_downloads,
             "kwargs": {},
         }]
-        if self._rss_urls:
-            services.append({
-                "id": "PigGoKidsMetadata.RssRefresh",
-                "name": "PigGo 儿童 RSS 刷新",
-                "trigger": IntervalTrigger(minutes=self._rss_interval_minutes),
-                "func": self.refresh_candidates,
-                "kwargs": {},
-            })
-        return services
 
     def _load_registry(self) -> dict[str, dict[str, Any]]:
         raw = self.get_data(REGISTRY_KEY) or {}
@@ -845,6 +828,7 @@ class PigGoKidsMetadata(_PluginBase):
             return False, None, "整理目标目录不存在"
         if existing := self._existing_poster(directory):
             return True, existing, "目标目录已有封面"
+        self._restore_candidate_artwork_references(task.candidate_id)
         references = self._candidate_artwork_references.get(str(task.candidate_id or ""), ())
         if not references:
             return False, None, "RSS 候选中没有可用封面"
@@ -862,6 +846,7 @@ class PigGoKidsMetadata(_PluginBase):
     def _display_artwork_reference(self, candidate_id: Optional[str]) -> Optional[str]:
         """只把不含查询参数和凭据的 HTTPS 图片地址交给 MoviePilot 持久化。"""
 
+        self._restore_candidate_artwork_references(candidate_id)
         for reference in self._candidate_artwork_references.get(str(candidate_id or ""), ()):
             if "***" in reference:
                 continue
@@ -880,6 +865,30 @@ class PigGoKidsMetadata(_PluginBase):
             ):
                 return reference
         return None
+
+    def _restore_candidate_artwork_references(self, candidate_id: Optional[str]) -> None:
+        """仅从已持久化候选恢复安全封面，绝不访问或刷新 RSS。"""
+
+        key = str(candidate_id or "")
+        if not key or self._candidate_artwork_references.get(key):
+            return
+        candidates = self._load_candidates()
+        candidate = next((item for item in candidates if item.candidate_id == key), None)
+        if not candidate:
+            return
+        related = [candidate]
+        if candidate.site_item_id:
+            related.extend(
+                item for item in candidates
+                if item.candidate_id != key and item.site_item_id == candidate.site_item_id
+            )
+        references: list[str] = []
+        for item in related:
+            if item.poster_url:
+                references.append(item.poster_url)
+            references.extend(extract_artwork_references(item.summary or ""))
+        if references:
+            self._candidate_artwork_references[key] = tuple(dict.fromkeys(references))
 
     @staticmethod
     def _reserve_download_for_plugin(task: ImportTask) -> bool:
@@ -1001,10 +1010,24 @@ class PigGoKidsMetadata(_PluginBase):
             return reference
         if reference := self._candidate_download_references.get(candidate.candidate_id):
             return reference
-        if candidate.source_feed_id != "manual":
-            self.refresh_candidates()
-            return self._candidate_download_references.get(candidate.candidate_id)
         return None
+
+    @staticmethod
+    def _host_download_label() -> str:
+        """保留插件接管标签，同时加入 MP 当前下载列表要求的系统标签。"""
+
+        labels = ["piggokids"]
+        try:
+            from app.core.config import settings
+
+            labels.extend(
+                item.strip()
+                for item in str(getattr(settings, "TORRENT_TAG", "") or "").split(",")
+                if item.strip()
+            )
+        except (ImportError, AttributeError):
+            pass
+        return ",".join(dict.fromkeys(labels))
 
     def _submit_download_to_host(self, candidate: FeedCandidate, reference: str) -> Any:
         if urlsplit(reference).scheme.casefold() in {"http", "https"}:
@@ -1046,7 +1069,7 @@ class PigGoKidsMetadata(_PluginBase):
             downloader=self._downloader or None,
             save_path=self._download_save_path or None,
             source=DOWNLOAD_SOURCE,
-            label="piggokids",
+            label=self._host_download_label(),
         )
 
     @staticmethod
@@ -1667,8 +1690,6 @@ class PigGoKidsMetadata(_PluginBase):
         task.transfer_failed_files = sorted(failed)
         self._save_task(task)
         if expected.issubset(succeeded):
-            if task.candidate_id and not self._candidate_artwork_references.get(task.candidate_id):
-                self.refresh_candidates()
             artwork_url = self._display_artwork_reference(task.candidate_id)
             self._backfill_host_history_artwork(task, artwork_url)
             if target_dir := self._history_target_dir(task):
@@ -1817,7 +1838,7 @@ class PigGoKidsMetadata(_PluginBase):
             "candidate_count": len(self._load_candidates()),
             "rss_feed_count": len(self._rss_urls),
             "rss_configured": bool(self._rss_urls),
-            "rss_interval_minutes": self._rss_interval_minutes,
+            "rss_refresh_mode": "manual_only",
             "downloader_configured": bool(self._downloader),
             "download_save_path_configured": bool(self._download_save_path),
             "auto_transfer": self._auto_transfer,
@@ -1884,13 +1905,6 @@ class PigGoKidsMetadata(_PluginBase):
         except (TypeError, ValueError):
             safe_limit = 100
         candidates = self._load_candidates()
-        if (
-            candidates
-            and self._rss_urls
-            and not self._candidate_artwork_references
-        ):
-            self.refresh_candidates()
-            candidates = self._load_candidates()
         items = []
         total = 0
         for item in reversed(candidates):
@@ -1925,10 +1939,6 @@ class PigGoKidsMetadata(_PluginBase):
         target_dir = self._history_target_dir(task)
         if not target_dir:
             return self._response(False, message="未从 MoviePilot 整理历史定位到本地媒体目录")
-        if not self._candidate_artwork_references.get(task.candidate_id):
-            refreshed = self.refresh_candidates()
-            if not refreshed.get("success"):
-                return self._response(False, message="RSS 刷新失败，暂时无法恢复封面链接")
         history_updated = self._backfill_host_history_artwork(
             task,
             self._display_artwork_reference(task.candidate_id),
@@ -1954,13 +1964,42 @@ class PigGoKidsMetadata(_PluginBase):
         values = dict(payload or {})
         try:
             kind = MediaKind(str(values.get("media_type") or MediaKind.UNKNOWN.value).casefold())
+            supplied_title = str(values.get("title") or "").strip()
             parsed = candidate_from_reference(
                 str(values.get("download_reference") or ""),
-                title=str(values.get("title") or "").strip() or None,
+                title=supplied_title or None,
                 media_type=kind,
             )
+            candidates = self._load_candidates()
+            cached = next(
+                (
+                    item for item in candidates
+                    if parsed.candidate.site_item_id
+                    and item.site_item_id == parsed.candidate.site_item_id
+                    and item.source_feed_id != "manual"
+                ),
+                None,
+            )
+            if cached:
+                candidate = FeedCandidate.from_dict(cached.to_dict())
+                candidate.reference_fingerprint = parsed.candidate.reference_fingerprint
+                candidate.download_url = parsed.candidate.download_url
+                if supplied_title:
+                    candidate.title = supplied_title
+                    candidate.title_overridden = True
+                if kind != MediaKind.UNKNOWN:
+                    candidate.media_type = kind
+                    candidate.media_type_overridden = True
+                parsed.candidate = candidate
+            poster_url = str(values.get("poster_url") or "").strip()
+            if poster_url:
+                safe_poster = safe_persisted_artwork_reference((poster_url,))
+                if not safe_poster:
+                    raise InvalidReferenceError("封面地址必须是无账号、无查询参数的公网 HTTPS URL")
+                parsed.candidate.poster_url = safe_poster
+                self._candidate_artwork_references[parsed.candidate.candidate_id] = (safe_poster,)
             self._candidate_download_references[parsed.candidate.candidate_id] = parsed.download_reference
-            merged = upsert_candidates(self._load_candidates(), [parsed.candidate])
+            merged = upsert_candidates(candidates, [parsed.candidate])
             self._save_candidates(merged)
             candidate = next(item for item in merged if item.candidate_id == parsed.candidate.candidate_id)
             return self._response(True, {"candidate": candidate.to_dict()})
