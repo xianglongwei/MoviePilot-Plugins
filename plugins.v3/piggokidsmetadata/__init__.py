@@ -62,7 +62,7 @@ class PigGoKidsMetadata(_PluginBase):
     plugin_name = "PigGo 儿童动画增强识别"
     plugin_desc = "从 PigGo RSS 或粘贴链接发起下载，并用本地 NFO、图片和文件名增强识别"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/emby.png"
-    plugin_version = "0.3.2"
+    plugin_version = "0.3.3"
     plugin_author = "xianglongwei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "piggokidsmetadata_"
@@ -1378,6 +1378,32 @@ class PigGoKidsMetadata(_PluginBase):
         except TypeError:
             return {}
 
+    @staticmethod
+    def _torrent_completed(torrent: dict[str, Any]) -> bool:
+        """兼容宿主返回的完成状态以及 0–1/0–100 两种进度尺度。"""
+
+        state = str(torrent.get("state") or "").strip().casefold()
+        if state in {
+            "complete",
+            "completed",
+            "seeding",
+            "uploading",
+            "stalledup",
+            "pausedup",
+            "queuedup",
+            "checkingup",
+            "完成",
+            "已完成",
+        }:
+            return True
+        try:
+            progress = float(torrent.get("progress") or 0)
+        except (TypeError, ValueError):
+            return False
+        if progress >= 100:
+            return True
+        return not state and 0 <= progress <= 1 and progress >= 1
+
     def _download_histories_by_hash(
         self,
         hashes: list[str],
@@ -1485,12 +1511,7 @@ class PigGoKidsMetadata(_PluginBase):
                 continue
             tracked += 1
             task.downloader = str(torrent.get("downloader") or task.downloader or "") or None
-            progress = torrent.get("progress") or 0
-            try:
-                completed = float(progress) >= 100
-            except (TypeError, ValueError):
-                completed = False
-            if not completed:
+            if not self._torrent_completed(torrent):
                 self._save_task(task)
                 continue
             relative = self._relative_source_from_host_path(torrent.get("path"))

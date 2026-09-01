@@ -440,7 +440,8 @@ class V2PluginContractTest(unittest.TestCase):
                     calls.append(kwargs)
                     return [{
                         "hash": "2" * 40,
-                        "progress": 100,
+                        "progress": 1.0,
+                        "state": "completed",
                         "path": str(payload),
                     }]
 
@@ -452,6 +453,14 @@ class V2PluginContractTest(unittest.TestCase):
             self.assertTrue(result["success"])
             self.assertEqual(calls[0]["hashs"], ["2" * 40])
             self.assertEqual(plugin.api_tasks()["data"]["items"][0]["state"], "READY_TO_TRANSFER")
+
+    def test_download_completion_supports_host_state_and_both_progress_scales(self) -> None:
+        completed = self.module.PigGoKidsMetadata._torrent_completed
+        self.assertTrue(completed({"state": "completed", "progress": 1.0}))
+        self.assertTrue(completed({"progress": 1.0}))
+        self.assertTrue(completed({"state": "downloading", "progress": 100}))
+        self.assertFalse(completed({"state": "downloading", "progress": 1.0}))
+        self.assertFalse(completed({"progress": 0.99}))
 
     def test_restart_recovery_uses_download_history_when_torrent_is_gone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
