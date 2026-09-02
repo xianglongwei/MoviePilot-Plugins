@@ -29,7 +29,8 @@ export default defineConfig({
     target: "esnext",
     minify: true,
     cssCodeSplit: true,
-    emptyOutDir: true,
+    // 保留上一版带哈希的联邦分包，兼容浏览器仍缓存旧 remoteEntry.js 的场景。
+    emptyOutDir: false,
     outDir: "../../plugins.v2/piggokidsmetadata/dist/assets",
     assetsDir: "",
   },
