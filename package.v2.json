@@ -66,5 +66,40 @@
             "v0.2.0": "第二阶段：增加安全 RSS 候选、粘贴链接、MoviePilot 下载提交、hash 跟踪、事件恢复和可选整理",
             "v0.1.0": "第一阶段：增加受限内容包扫描、NFO 与图片识别、稳定本地身份、冲突决策和手工扫描接口"
         }
+    },
+    "AutoSubtitle": {
+        "name": "自动字幕下载",
+        "description": "文件整理完成后自动搜索并下载缺失的字幕",
+        "labels": "字幕",
+        "version": "1.1",
+        "v3": false,
+        "icon": "subtitle.png",
+        "author": "yubanmeiqin9048",
+        "level": 2,
+        "history": {
+            "v1.1": "添加自动调轴功能和内封字幕检测",
+            "v1.0": "初版"
+        }
+    },
+    "SubtitleAssistant": {
+        "name": "字幕助手",
+        "description": "覆盖搜索、匹配、下载、归属、落盘、维护与审计的字幕全生命周期管理。",
+        "labels": "字幕",
+        "version": "1.4.1",
+        "v3": false,
+        "icon": "https://raw.githubusercontent.com/yubanmeiqin9048/MoviePilot-Plugins/main/icons/SubtitleAssistant.png",
+        "author": "yubanmeiqin9048",
+        "level": 1,
+        "system_version": ">=2.15.1",
+        "history": {
+            "v1.4.1": "字幕搜索加入分页",
+            "v1.4": "精简功能，聚焦核心实现",
+            "v1.3": "重构批量重配页面",
+            "v1.2.1": "前端仅发布构建产物减少文件下载",
+            "v1.2": "插件重构",
+            "v1.1": "重构手动搜索和设置页",
+            "v1.0.1": "修复 Vue 联邦构建产物未进入发布仓库",
+            "v1.0": "初版"
+        }
     }
 }
