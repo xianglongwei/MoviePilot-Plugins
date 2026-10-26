@@ -107,3 +107,17 @@ and receiver mapping compatibility require a later authorized integration test.
 The provided SDK snapshot names its transfer result schema
 `TransferResultContractData`, not `TransferCompleteContractData`; the bridge
 reads its documented payload fields without depending on either schema name.
+
+## 安装要求（v3 实测记录）
+
+MoviePilot v3 **不会**因为目录存在就加载插件：
+
+- `UserInstalledPlugins` 只回答“包在磁盘上”，装载判据是**插件实例表的启用位**
+  （`runtime.py`: `loadable_plugins=lambda: list(instances.enabled_hosts())`）。
+- 直接把 `plugins.v3/mpeventbridge/` 拷进容器的 `/app/app/plugins/` 并写
+  `systemconfig['plugin.MpEventBridge']`，`POST /api/v1/plugin/reload/MpEventBridge`
+  仍返回 `插件 MpEventBridge 加载失败：加载器未返回匹配的插件类`——因为没有任何实例记录。
+  用同一套 `PluginLoader(plugins_root=/app/app/plugins)` 单独调用却能正常返回类，
+  说明目录和代码没问题，缺的是实例登记。
+- 正确路径：通过插件市场安装（`package.v3.json` 被 MP 读取 → 创建实例 → 启用），
+  或让 UI 里的安装动作创建实例；命令行硬塞目录不可行。
