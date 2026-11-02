@@ -177,7 +177,8 @@ class NormalizationTest(unittest.TestCase):
         self.assertIs(handlers[FakeEventType.TransferComplete], bridge.MpEventBridge.on_transfer_complete)
         self.assertIs(handlers[FakeEventType.MetadataScrape], bridge.MpEventBridge.on_metadata_scrape)
         self.assertEqual({(api["path"], tuple(api["methods"]), api["auth"]) for api in plugin.get_api()},
-                         {("/state", ("GET",), "bear"), ("/test", ("POST",), "bear")})
+                         {("/state", ("GET",), "bear"), ("/test", ("POST",), "bear"),
+                          ("/progress", ("POST",), "bear")})
         manifest = json.loads((ROOT / "package.v3.json").read_text())["MpEventBridge"]
         self.assertEqual(manifest["version"], plugin.plugin_version)
         self.assertEqual(manifest["system_version"], ">=3.0.0")

@@ -1,4 +1,4 @@
-# MpEventBridge 0.1.0
+# MpEventBridge 0.1.1
 
 For MoviePilot v3. Enable the plugin and configure the same signing secret as
 p115-302. `endpoint` is an HTTP(S) origin, defaulting to
@@ -92,12 +92,80 @@ for the delivery result. With no parameter it targets
 and counts as failure even though its HTTP status is 200. A disabled plugin
 returns `ok: false`, `queued: 0`, `reason: disabled` without starting a worker.
 
+## 入站订阅进度回写
+
+`POST /api/v1/plugin/MpEventBridge/progress` 声明 `auth: "bear"`，使用 MP 的
+鉴权依赖，不使用出站事件的 HMAC 密钥。入站回写不依赖出站 `enabled` 开关，
+也不需要启动事件队列或事件循环。请求字段沿用 `mp-progress-contract.md`：
+
+```http
+POST /api/v1/plugin/MpEventBridge/progress
+X-API-KEY: <MP API_TOKEN>
+Content-Type: application/json
+
+{"sub_id":1573,"season":4,"episodes":[1,2,3,4],"origin":"p115-302","observed_at":1793585616.0}
+```
+
+`sub_id` 是订阅 ID；`season: 0`（或省略）使用订阅自身季号。季号缺失或与订阅
+不匹配时返回 `skipped / no_season`，避免把其他季的进度合并到当前订阅。
+`episodes` 是该季 Emby 实存集号的整数数组，允许重复、无序或空数组；其余字段忽略。
+只处理电视剧及 `total_episode > 0` 的订阅；任何传入集号超过总集数时整条拒绝，
+不写库、不识别、不完成，返回 `skipped / episode_out_of_range`。
+
+更新算法保留原有 note 中的数字，与 `episodes ∩ {start_episode or 1 ... total_episode}`
+取并集后排序；缺集数是预期集号与新 note 的差集大小。已有 note 中超出预期的数字保留，
+但不参与补齐缺集。只写发生变化的 `note` / `lack_episode` 字段。
+**空数组保留原有 note，只重算缺集数**：这遵循契约“插件侧语义”第 4 条的并集算法；
+契约请求字段说明中的“清空 note”与此矛盾，本实现不清空。
+
+处理结果默认 HTTP 200，响应示例：
+
+```json
+{"ok":true,"state":"updated","lack_episode":4,"reason":null,"note":[1,2,3,4]}
+```
+
+| state | ok | 语义 / reason |
+| --- | --- | --- |
+| `updated` | true | 已合并（可能无需写库）；普通未齐全时 `reason: null` |
+| `finished` | true | 齐全后识别媒体，并调用 MP 完成链；携带 `note`、`lack_episode: 0` |
+| `updated` | true | `pending`：状态 P；`best_version`：洗版；均只更新、不完成 |
+| `skipped` | true | `not_tv`、`no_total_episode`、`no_season`、`episode_out_of_range` |
+| `not_found` | false | 订阅不存在，响应只有 `ok` 和 `state` |
+| `error` | false | 内部异常，`reason` 为异常文本的前 200 字符 |
+
+齐全且非洗版、非 P 时，使用 `build_subscribe_meta` 和订阅身份参数进行一次
+`MediaChain().recognize_media(..., cache=False)`，随后调用
+`SubscribeChain().finish_subscribe_or_not(..., downloads=None, lefts={}, force=True)`。
+暂停 S 允许完成。媒体识别失败返回 `error`，不调用完成链；进度写入可能已经成功，
+下一次相同推送会重试完成。完成链抛异常也返回 `error`，不会向调用方抛出 500。
+鉴权失败以及 FastAPI 对缺失/非对象 JSON body 的校验错误发生在处理函数之前，
+仍使用宿主 HTTP 状态码。
+
+重复推送未齐全的相同集合仍返回 `updated`，不重复写库；P / 洗版同理。
+成功移入历史后活动订阅已删除，重推同一 ID 返回 `not_found`，不再次完成。
+因此契约中“幂等”指进度和完成副作用不会重复，完成迁移后的响应状态会改变。
+同一进程内的回写请求用同步锁串行执行读取、合并、写库和完成；此锁不覆盖 MP
+核心或其他插件的写入，也不跨多个 MP 进程。
+MP 完成链还允许其他插件通过 `SubscribeCompletionCheck` 否决迁移且不抛异常；
+本接口按契约在完成链正常返回后报告 `finished`，没有额外查询历史确认这类否决。
+
+本次快照的 `app/api/endpoints/plugin.py` 将路由注册委托给
+`app.application.plugin.routes.register_plugin_api`，但未包含该模块源码，
+所以暂无法从快照核实实际路由包装及 `auth: "bear"` 的依赖映射。
+离线测试验证了 FastAPI 直接挂载时的 JSON body 和 HTTP 200 异常响应；
+真实宿主挂载及 `X-API-KEY` 支持仍需补齐注册模块后核实。
+
 ## Offline verification
 
 ```bash
-python -m unittest
-python -m unittest discover -s tests/v3/mpeventbridge -v
+python3 -m unittest
+python3 -m unittest discover -s tests/v3/mpeventbridge -v
 ```
+
+0.1.1 离线验证：插件目录命令输出 57 行，`Ran 52 tests` / `OK`；
+仓库根命令输出 5 行，`Ran 144 tests` / `OK (skipped=2)`。
+两项跳过均为 `test_subtitle_plugins.HostSmokeTests` 中原有的宿主环境测试，
+本地未安装 MP；两条命令退出码均为 0。
 
 Tests use lightweight SDK stubs and fake asynchronous clients. The fixed HMAC
 vector was independently calculated with OpenSSL. No network, container,

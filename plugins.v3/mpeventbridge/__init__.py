@@ -134,12 +134,15 @@ class MpEventBridge(_PluginBase):
     plugin_name = "事件桥"
     plugin_desc = "将整理和刮削事件异步转发给 p115-302，按目录去抖合并并签名"
     plugin_icon = "https://raw.githubusercontent.com/xianglongwei/MoviePilot-Plugins/main/icons/speed.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "wei"
     author_url = "https://github.com/xianglongwei/MoviePilot-Plugins"
     plugin_config_prefix = "mpeventbridge_"
     plugin_order = 30
     auth_level = 1
+
+    # Serialize read/merge/write and completion across request threads and instances.
+    _progress_lock = threading.RLock()
 
     def __init__(self):
         super().__init__()
@@ -333,7 +336,82 @@ class MpEventBridge(_PluginBase):
              "summary": "查看事件桥状态", "description": "最近二十条发送记录与累计计数"},
             {"path": "/test", "endpoint": self.api_test, "methods": ["POST"], "auth": "bear",
              "summary": "测试事件桥", "description": "合成事件经过归一化、队列、去抖、签名和发送"},
+            {"path": "/progress", "endpoint": self.api_progress, "methods": ["POST"], "auth": "bear",
+             "summary": "回写订阅集数", "description": "合并 Emby 实存集数，齐全后完成普通订阅"},
         ]
+
+    def api_progress(self, payload: dict) -> dict:
+        """Apply observed episodes synchronously; host dependencies stay lazy."""
+        try:
+            with self._progress_lock:
+                return self._update_progress(payload)
+        except Exception as exc:
+            return {"ok": False, "state": "error", "reason": str(exc)[:200]}
+
+    def _update_progress(self, payload: dict) -> dict:
+        from app.db.oper.subscribe import SubscribeOper
+        from app.schemas.types import MediaType
+
+        oper = SubscribeOper()
+        subscribe = oper.get(int(payload["sub_id"]))
+        if subscribe is None:
+            return {"ok": False, "state": "not_found"}
+        if subscribe.type != MediaType.TV.value:
+            return {"ok": True, "state": "skipped", "reason": "not_tv"}
+        total = int(subscribe.total_episode or 0)
+        if total <= 0:
+            return {"ok": True, "state": "skipped", "reason": "no_total_episode"}
+
+        episodes = payload["episodes"]
+        if not isinstance(episodes, list) or any(type(item) is not int for item in episodes):
+            raise ValueError("episodes must be an array of integers")
+        if episodes and max(episodes) > total:
+            return {"ok": True, "state": "skipped", "reason": "episode_out_of_range"}
+        season = int(payload.get("season", 0) or subscribe.season or 0)
+        if season <= 0 or season != subscribe.season:
+            return {"ok": True, "state": "skipped", "reason": "no_season"}
+
+        expected = set(range(int(subscribe.start_episode or 1), total + 1))
+        current_note = {int(item) for item in (subscribe.note or []) if str(item).isdigit()}
+        note = sorted(current_note | (set(episodes) & expected))
+        lack = len(expected - set(note))
+        updates = {}
+        if set(note) != current_note:
+            updates["note"] = note
+        if lack != int(subscribe.lack_episode or 0):
+            updates["lack_episode"] = lack
+        if updates:
+            if oper.update(subscribe.id, updates) is None:
+                return {"ok": False, "state": "not_found"}
+            # Oper may return a different detached row; completion needs the merged facts.
+            for key, value in updates.items():
+                setattr(subscribe, key, value)
+
+        result = {"ok": True, "state": "updated", "lack_episode": lack,
+                  "reason": None, "note": note}
+        if subscribe.best_version:
+            result["reason"] = "best_version"
+        elif subscribe.state == "P":
+            result["reason"] = "pending"
+        elif lack == 0:
+            from app.application.subscription.contract import build_subscribe_meta
+            from app.chain.media import MediaChain
+            from app.chain.subscribe import SubscribeChain
+            from app.chain.subscribe.identity import subscribe_recognize_kwargs
+
+            meta = build_subscribe_meta(subscribe)
+            mediainfo = MediaChain().recognize_media(
+                meta=meta, mtype=MediaType(subscribe.type),
+                **subscribe_recognize_kwargs(subscribe), cache=False,
+            )
+            if mediainfo is None:
+                raise ValueError("media recognition failed")
+            SubscribeChain().finish_subscribe_or_not(
+                subscribe=subscribe, meta=meta, mediainfo=mediainfo,
+                downloads=None, lefts={}, force=True,
+            )
+            result["state"] = "finished"
+        return result
 
     async def _snapshot(self):
         return {"enabled": self._enabled, "config_error": self._config_error,
