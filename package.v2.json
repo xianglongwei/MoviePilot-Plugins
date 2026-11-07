@@ -101,5 +101,18 @@
             "v1.0.1": "修复 Vue 联邦构建产物未进入发布仓库",
             "v1.0": "初版"
         }
+    },
+    "MediaWarp": {
+        "name": "MediaWarp 多服务器",
+        "description": "同时反代多台 Emby/Jellyfin，独立端口、STRM 直链、美化与进程守护。",
+        "labels": "Emby,Jellyfin,反向代理,STRM",
+        "version": "1.1.0",
+        "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/refs/heads/main/icons/cloud.png",
+        "author": "DDSRem, xianglongwei",
+        "level": 1,
+        "v3": false,
+        "history": {
+            "v1.1.0": "支持多台 Emby/Jellyfin 独立端口、STRM路径和功能开关；配置/日志隔离，异常进程自动重启，兼容旧版单服务器配置。"
+        }
     }
 }
