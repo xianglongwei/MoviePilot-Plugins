@@ -20,7 +20,7 @@ class QBUploadCap(_PluginBase):
     plugin_name = "QB/TR完成后上传限速"
     plugin_desc = "下载完成后将 qBittorrent 或 Transmission 单任务上传速度限制为指定值，默认 100 KB/s。"
     plugin_icon = "speed.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_label = "qBittorrent,下载管理,上传限速"
     plugin_author = "xianglongwei"
     plugin_config_prefix = "qbuploadcap_"
@@ -118,16 +118,12 @@ class QBUploadCap(_PluginBase):
                             if not torrent_hash:
                                 continue
                             try:
-                                if downloader_type == DownloaderType.Qbittorrent:
-                                    server.qbc.torrents_set_upload_limit(
-                                        torrent_hashes=torrent_hash,
-                                        upload_limit=self._limit_kb * 1024,
-                                    )
-                                else:
-                                    server.change_torrent(
-                                        hash_string=torrent_hash,
-                                        upload_limit=self._limit_kb,
-                                    )
+                                # MoviePilot's adapter handles each downloader's API
+                                # and units (qBittorrent requires `limit`, in bytes/s).
+                                server.change_torrent(
+                                    hash_string=torrent_hash,
+                                    upload_limit=self._limit_kb,
+                                )
                                 total += 1
                                 logger.info(
                                     f"QB/TR完成后上传限速：{name} / "
