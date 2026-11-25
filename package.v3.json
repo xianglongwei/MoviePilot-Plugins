@@ -91,5 +91,18 @@
             "v0.1.1": "新增订阅集数回写接口，合并实存进度并在齐全后完成普通订阅",
             "v0.1.0": "首次发布：整理与刮削事件归一化、异步队列、目录去抖、签名重试和鉴权调试接口"
         }
+    },
+    "QBUploadCap": {
+        "name": "QB/TR完成后上传限速",
+        "description": "下载完成后为 qBittorrent 或 Transmission 单任务设置上传限速，默认 100 KB/s，保留做种和 tracker 汇报。",
+        "labels": "qBittorrent,Transmission,下载管理,上传限速",
+        "version": "0.1.0",
+        "icon": "speed.png",
+        "author": "xianglongwei",
+        "level": 1,
+        "system_version": ">=3.0.0",
+        "history": {
+            "v0.1.0": "首版：定时扫描 qBittorrent 和 Transmission 已完成任务并设置可配置的单任务上传限速，默认 100 KB/s。"
+        }
     }
 }
